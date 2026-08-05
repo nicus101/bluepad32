@@ -138,10 +138,24 @@ void uni_hid_parser_keyboard_setup(uni_hid_device_t* d) {
 }
 
 void uni_hid_parser_keyboard_parse_input_report(struct uni_hid_device_s* d, const uint8_t* report, uint16_t len) {
-    ARG_UNUSED(d);
-    ARG_UNUSED(report);
-    ARG_UNUSED(len);
-    // printf_hexdump(report, len);
+    // Boot keyboard report format:
+    // [0]=modifiers, [1]=reserved, [2..7]=up to 6 simultaneous keys.
+    if (len < 8) {
+        return;
+    }
+
+    uni_controller_t* ctl = &d->controller;
+    memset(ctl, 0, sizeof(*ctl));
+    ctl->klass = UNI_CONTROLLER_CLASS_KEYBOARD;
+    ctl->keyboard.modifiers = report[0];
+
+    int idx = 0;
+    for (int i = 2; i < 8 && idx < UNI_KEYBOARD_PRESSED_KEYS_MAX; i++) {
+        uint8_t usage = report[i];
+        if (usage == 0)
+            continue;
+        ctl->keyboard.pressed_keys[idx++] = usage;
+    }
 }
 
 void uni_hid_parser_keyboard_init_report(uni_hid_device_t* d) {
