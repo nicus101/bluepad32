@@ -6,6 +6,9 @@
 <img src="https://github.com/ricardoquesada/bluepad32/blob/develop/docs/images/bluepad32_logo_ok_280.png?raw=true" alt="drawing" width="216"/>
 </p>
 
+Slightly modified version of bluepad32 to give it freatures i need in my project.
+I had problems with using bt tlv flash bank and with some devices so i added support for them.
+
 A Bluetooth controller "host" for the ESP32, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-H2, Raspberry Pi Pico W, Pico 2 W, and
 Posix (Linux, macOS).
 
