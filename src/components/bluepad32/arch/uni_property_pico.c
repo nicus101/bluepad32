@@ -51,18 +51,22 @@ void uni_property_set_with_property(const uni_property_t* p, uni_property_value_
             data = (uint8_t*)&value.f32;
             size = sizeof(value.f32);
             break;
+        case UNI_PROPERTY_TYPE_STRING:
+            data = (uint8_t*)value.str;
+            size = value.str ? (int)strlen(value.str) + 1 : 0;
+            break;
         default:
             loge("uni_property_set_with_property: unsupported type %d\n", p->type);
             return;
     }
 
-    if (tlv_impl->store_tag(tlv_context, pico_get_tag_for_index(p->idx), data, size)) {
+    if (size > 0 && tlv_impl->store_tag(tlv_context, pico_get_tag_for_index(p->idx), data, size)) {
         loge("Failed to store property %s(%d)\n", p->name, p->idx);
     }
 }
 
 uni_property_value_t uni_property_get_with_property(const uni_property_t* p) {
-    uni_property_value_t value;
+    uni_property_value_t value = {0};
     int size;
     int read;
 
@@ -73,8 +77,14 @@ uni_property_value_t uni_property_get_with_property(const uni_property_t* p) {
     }
 
     if (p->type == UNI_PROPERTY_TYPE_STRING) {
-        loge("No TLV for %s, returning default value '%s'\n", p->name, p->default_value.str);
-        return p->default_value;
+        static char str_buf[128];
+        read = tlv_impl->get_tag(tlv_context, pico_get_tag_for_index(p->idx), (uint8_t*)str_buf, sizeof(str_buf) - 1);
+        if (read == 0) {
+            return p->default_value;
+        }
+        str_buf[read] = '\0';
+        value.str = str_buf;
+        return value;
     }
 
     switch (p->type) {
