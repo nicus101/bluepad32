@@ -433,9 +433,11 @@ static void uni_device_information_packet_handler(uint8_t packet_type,
                         break;
                     }
 
-                    // Some BLE keyboards fail during REPORT mode setup but work in BOOT mode.
+                    // Some BLE keyboards and mice fail during REPORT mode setup but work in BOOT mode.
                     requested_protocol_mode =
-                        uni_hid_device_is_keyboard(device) ? HID_PROTOCOL_MODE_BOOT : HID_PROTOCOL_MODE_REPORT;
+                        (uni_hid_device_is_keyboard(device) || uni_hid_device_is_mouse(device))
+                            ? HID_PROTOCOL_MODE_BOOT
+                            : HID_PROTOCOL_MODE_REPORT;
 
                     // Continue - query primary services.
                     logi("Search for HID service, con_handle: %#x, protocol_mode=%d\n", con_handle,

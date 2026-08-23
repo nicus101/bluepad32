@@ -23,7 +23,7 @@ static void update_allowlist_to_property(void) {
     // 00:22:33:44:55:66,11:AB:8B:99:44:8A
     uni_property_value_t val;
 
-    char str[128];
+    char str[512];
 
     str[0] = 0;
 
