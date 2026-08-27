@@ -345,14 +345,29 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
             event = hci_event_packet_get_type(packet);
             switch (event) {
                 // HCI EVENTS
+                case GAP_EVENT_SECURITY_LEVEL: {
+                    handle = gap_event_security_level_get_handle(packet);
+                    uint8_t level = gap_event_security_level_get_security_level(packet);
+                    logi("--> GAP_EVENT_SECURITY_LEVEL: handle=0x%04x, level=%d\n", handle, level);
+                    if (IS_ENABLED(UNI_ENABLE_BREDR) && gap_get_connection_type(handle) == GAP_CONNECTION_ACL) {
+                        uni_bt_bredr_on_gap_security_level(handle, level);
+                    }
+                    break;
+                }
                 case HCI_EVENT_LE_META:
                     if (IS_ENABLED(UNI_ENABLE_BLE))
                         uni_bt_le_on_hci_event_le_meta(packet, size);
                     break;
-                case HCI_EVENT_ENCRYPTION_CHANGE:
-                    if (IS_ENABLED(UNI_ENABLE_BLE))
+                case HCI_EVENT_ENCRYPTION_CHANGE: {
+                    handle = hci_event_encryption_change_get_connection_handle(packet);
+                    uint8_t enc_enabled = hci_event_encryption_change_get_encryption_enabled(packet);
+                    logi("--> HCI_EVENT_ENCRYPTION_CHANGE: handle=0x%04x, enabled=%d\n", handle, enc_enabled);
+                    if (IS_ENABLED(UNI_ENABLE_BLE) && gap_get_connection_type(handle) == GAP_CONNECTION_LE)
                         uni_bt_le_on_hci_event_encryption_change(packet, size);
+                    if (IS_ENABLED(UNI_ENABLE_BREDR) && gap_get_connection_type(handle) == GAP_CONNECTION_ACL)
+                        uni_bt_bredr_on_hci_encryption_change(handle, enc_enabled);
                     break;
+                }
                 case HCI_EVENT_COMMAND_COMPLETE: {
                     uint16_t opcode = hci_event_command_complete_get_command_opcode(packet);
                     const uint8_t* param = hci_event_command_complete_get_return_parameters(packet);
@@ -366,7 +381,7 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                     status = hci_event_authentication_complete_get_status(packet);
                     handle = hci_event_authentication_complete_get_connection_handle(packet);
                     logi("--> HCI_EVENT_AUTHENTICATION_COMPLETE_EVENT: status=%d, handle=0x%04x\n", status, handle);
-                    if (status == 0 && IS_ENABLED(UNI_ENABLE_BREDR)) {
+                    if (status == 0 && IS_ENABLED(UNI_ENABLE_BREDR) && gap_get_connection_type(handle) == GAP_CONNECTION_ACL) {
                         uni_bt_bredr_on_hci_authentication_complete(handle);
                     }
                     break;
