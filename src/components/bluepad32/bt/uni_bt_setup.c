@@ -5,6 +5,9 @@
 #include "bt/uni_bt_setup.h"
 
 #include <btstack.h>
+#include <btstack_tlv.h>
+#include <classic/btstack_link_key_db_tlv.h>
+#include <ble/le_device_db_tlv.h>
 
 #include "sdkconfig.h"
 
@@ -132,6 +135,19 @@ int uni_bt_setup(void) {
 
     // Initialize L2CAP
     l2cap_init();
+
+    // Re-link persistent TLV storage to HCI stack since l2cap_init() calls hci_init() which clears hci_stack
+    const btstack_tlv_t *tlv_impl = NULL;
+    void *tlv_context = NULL;
+    btstack_tlv_get_instance(&tlv_impl, &tlv_context);
+    if (tlv_impl && tlv_context) {
+#ifdef ENABLE_CLASSIC
+        hci_set_link_key_db(btstack_link_key_db_tlv_get_instance(tlv_impl, tlv_context));
+#endif
+#ifdef ENABLE_BLE
+        le_device_db_tlv_configure(tlv_impl, tlv_context);
+#endif
+    }
 
     if (IS_ENABLED(UNI_ENABLE_BREDR))
         bredr_enabled = uni_bt_bredr_is_enabled();

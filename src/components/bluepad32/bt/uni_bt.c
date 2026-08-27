@@ -61,6 +61,7 @@
 
 #include "sdkconfig.h"
 
+#include "bt/uni_bt_allowlist.h"
 #include "bt/uni_bt_bredr.h"
 #include "bt/uni_bt_hci_cmd.h"
 #include "bt/uni_bt_le.h"
@@ -344,14 +345,29 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
             event = hci_event_packet_get_type(packet);
             switch (event) {
                 // HCI EVENTS
+                case GAP_EVENT_SECURITY_LEVEL: {
+                    handle = gap_event_security_level_get_handle(packet);
+                    uint8_t level = gap_event_security_level_get_security_level(packet);
+                    logi("--> GAP_EVENT_SECURITY_LEVEL: handle=0x%04x, level=%d\n", handle, level);
+                    if (IS_ENABLED(UNI_ENABLE_BREDR) && gap_get_connection_type(handle) == GAP_CONNECTION_ACL) {
+                        uni_bt_bredr_on_gap_security_level(handle, level);
+                    }
+                    break;
+                }
                 case HCI_EVENT_LE_META:
                     if (IS_ENABLED(UNI_ENABLE_BLE))
                         uni_bt_le_on_hci_event_le_meta(packet, size);
                     break;
-                case HCI_EVENT_ENCRYPTION_CHANGE:
-                    if (IS_ENABLED(UNI_ENABLE_BLE))
+                case HCI_EVENT_ENCRYPTION_CHANGE: {
+                    handle = hci_event_encryption_change_get_connection_handle(packet);
+                    uint8_t enc_enabled = hci_event_encryption_change_get_encryption_enabled(packet);
+                    logi("--> HCI_EVENT_ENCRYPTION_CHANGE: handle=0x%04x, enabled=%d\n", handle, enc_enabled);
+                    if (IS_ENABLED(UNI_ENABLE_BLE) && gap_get_connection_type(handle) == GAP_CONNECTION_LE)
                         uni_bt_le_on_hci_event_encryption_change(packet, size);
+                    if (IS_ENABLED(UNI_ENABLE_BREDR) && gap_get_connection_type(handle) == GAP_CONNECTION_ACL)
+                        uni_bt_bredr_on_hci_encryption_change(handle, enc_enabled);
                     break;
+                }
                 case HCI_EVENT_COMMAND_COMPLETE: {
                     uint16_t opcode = hci_event_command_complete_get_command_opcode(packet);
                     const uint8_t* param = hci_event_command_complete_get_return_parameters(packet);
@@ -365,6 +381,9 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                     status = hci_event_authentication_complete_get_status(packet);
                     handle = hci_event_authentication_complete_get_connection_handle(packet);
                     logi("--> HCI_EVENT_AUTHENTICATION_COMPLETE_EVENT: status=%d, handle=0x%04x\n", status, handle);
+                    if (status == 0 && IS_ENABLED(UNI_ENABLE_BREDR) && gap_get_connection_type(handle) == GAP_CONNECTION_ACL) {
+                        uni_bt_bredr_on_hci_authentication_complete(handle);
+                    }
                     break;
                 }
                 case HCI_EVENT_PIN_CODE_REQUEST: {
@@ -372,12 +391,20 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                         uni_bt_bredr_on_hci_pin_code_request(channel, packet, size);
                     break;
                 }
-                case HCI_EVENT_USER_CONFIRMATION_REQUEST:
-                    // inform about user confirmation request
-                    logi("SSP User Confirmation Request with numeric value '%" PRIu32 "'\n",
-                         little_endian_read_32(packet, 8));
-                    logi("SSP User Confirmation Auto accept\n");
+                case HCI_EVENT_USER_CONFIRMATION_REQUEST: {
+                    bd_addr_t ssp_addr;
+                    hci_event_user_confirmation_request_get_bd_addr(packet, ssp_addr);
+                    logi("SSP User Confirmation Request for %s (val='%" PRIu32 "')\n",
+                         bd_addr_to_str(ssp_addr), little_endian_read_32(packet, 8));
+                    if (!uni_bt_allowlist_is_allowed_addr(ssp_addr)) {
+                        logi("Rejecting SSP Confirmation Request: %s not in allowlist\n", bd_addr_to_str(ssp_addr));
+                        gap_ssp_confirmation_negative(ssp_addr);
+                    } else {
+                        logi("SSP User Confirmation Auto accept for %s\n", bd_addr_to_str(ssp_addr));
+                        gap_ssp_confirmation_response(ssp_addr);
+                    }
                     break;
+                }
                 case HCI_EVENT_HID_META: {
                     uint8_t code = hci_event_hid_meta_get_subevent_code(packet);
                     logi("HCI HID META SUBEVENT: 0x%02x\n", code);
@@ -543,10 +570,13 @@ void uni_bt_set_gap_security_level(int gap) {
 }
 
 int uni_bt_get_gap_security_level() {
+#ifdef CONFIG_BLUEPAD32_GAP_SECURITY
+    return CONFIG_BLUEPAD32_GAP_SECURITY;
+#else
     uni_property_value_t val;
-
     val = uni_property_get(UNI_PROPERTY_IDX_GAP_LEVEL);
-    return val.u32;
+    return (val.u8 > 0) ? val.u8 : 2;
+#endif
 }
 
 void uni_bt_set_gap_inquiry_length(int len) {

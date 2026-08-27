@@ -39,6 +39,7 @@
 #include "uni_config.h"
 #include "uni_log.h"
 #include "uni_virtual_device.h"
+#include "flash_storage.h"
 
 enum {
     // TODO: Why do they start at bit 8 and not bit 0 (???).
@@ -562,6 +563,14 @@ void uni_hid_device_dump_all(void) {
 }
 
 bool uni_hid_device_guess_controller_type_from_name(uni_hid_device_t* d, const char* name) {
+    if (!d)
+        return false;
+
+    if (uni_hid_device_is_mouse(d) || uni_hid_device_is_keyboard(d)) {
+        uni_hid_device_guess_controller_type_from_pid_vid(d);
+        return true;
+    }
+
     if (!name)
         return false;
 
@@ -879,8 +888,25 @@ bool uni_hid_device_is_mouse(const uni_hid_device_t* d) {
         return false;
     }
 
-    uint32_t mouse_cod = UNI_BT_COD_MAJOR_PERIPHERAL | UNI_BT_COD_MINOR_MICE;
-    return (d->cod & mouse_cod) == mouse_cod;
+    if (d->controller_type == CONTROLLER_TYPE_GenericMouse ||
+        d->controller.klass == UNI_CONTROLLER_CLASS_MOUSE) {
+        return true;
+    }
+
+    if ((d->cod & UNI_BT_COD_MAJOR_MASK) == UNI_BT_COD_MAJOR_PERIPHERAL) {
+        if (d->cod & UNI_BT_COD_MINOR_MICE) {
+            return true;
+        }
+    }
+
+    gamepad_info_t info;
+    if (flash_storage_get_device_info(d->conn.btaddr, &info)) {
+        if (info.default_mode == 1 || (info.port >= 0 && strstr(info.name, "Mouse") != NULL) || strstr(info.friendly_name, "Mouse") != NULL) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool uni_hid_device_is_keyboard(const uni_hid_device_t* d) {
@@ -888,13 +914,34 @@ bool uni_hid_device_is_keyboard(const uni_hid_device_t* d) {
         loge("uni_hid_device_is_keyboard: failed, device is NULL\n");
         return false;
     }
-    uint32_t keyboard_cod = UNI_BT_COD_MAJOR_PERIPHERAL | UNI_BT_COD_MINOR_KEYBOARD;
-    return (d->cod & keyboard_cod) == keyboard_cod;
+
+    if (d->controller_type == CONTROLLER_TYPE_GenericKeyboard ||
+        d->controller.klass == UNI_CONTROLLER_CLASS_KEYBOARD) {
+        return true;
+    }
+
+    if ((d->cod & UNI_BT_COD_MAJOR_MASK) == UNI_BT_COD_MAJOR_PERIPHERAL) {
+        if (d->cod & UNI_BT_COD_MINOR_KEYBOARD) {
+            return true;
+        }
+    }
+
+    gamepad_info_t info;
+    if (flash_storage_get_device_info(d->conn.btaddr, &info)) {
+        if (info.port == -1) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool uni_hid_device_is_gamepad(const uni_hid_device_t* d) {
     if (d == NULL) {
         loge("uni_hid_device_is_gamepad: failed, device is NULL\n");
+        return false;
+    }
+    if (uni_hid_device_is_mouse(d) || uni_hid_device_is_keyboard(d)) {
         return false;
     }
     // If it is a gamepad or a joystick, then we treat it as a gamepad

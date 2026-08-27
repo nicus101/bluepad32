@@ -67,12 +67,14 @@
 
 #include "bt/uni_bt_conn.h"
 #include "bt/uni_bt_defines.h"
+#include "bt/uni_bt_allowlist.h"
 #include "parser/uni_hid_parser.h"
 #include "uni_common.h"
 #include "uni_config.h"
 #include "uni_hid_device.h"
 #include "uni_log.h"
 #include "uni_property.h"
+#include "flash_storage.h"
 
 static bool is_scanning;
 static bool ble_enabled;
@@ -433,9 +435,19 @@ static void uni_device_information_packet_handler(uint8_t packet_type,
                         break;
                     }
 
-                    // Some BLE keyboards fail during REPORT mode setup but work in BOOT mode.
+                    if (!uni_hid_device_has_name(device)) {
+                        gamepad_info_t info;
+                        if (flash_storage_get_device_info(device->conn.btaddr, &info) && strlen(info.name) > 0) {
+                            uni_hid_device_set_name(device, info.name);
+                            uni_hid_device_guess_controller_type_from_name(device, device->name);
+                        }
+                    }
+
+                    // Some BLE keyboards and mice fail during REPORT mode setup but work in BOOT mode.
                     requested_protocol_mode =
-                        uni_hid_device_is_keyboard(device) ? HID_PROTOCOL_MODE_BOOT : HID_PROTOCOL_MODE_REPORT;
+                        (uni_hid_device_is_keyboard(device) || uni_hid_device_is_mouse(device))
+                            ? HID_PROTOCOL_MODE_BOOT
+                            : HID_PROTOCOL_MODE_REPORT;
 
                     // Continue - query primary services.
                     logi("Search for HID service, con_handle: %#x, protocol_mode=%d\n", con_handle,
@@ -840,12 +852,34 @@ void uni_bt_le_on_gap_event_advertising_report(const uint8_t* packet, uint16_t s
 
     adv_event_get_data(packet, &appearance, name);
 
-    if (appearance != UNI_BT_HID_APPEARANCE_GAMEPAD && appearance != UNI_BT_HID_APPEARANCE_JOYSTICK &&
+    gamepad_info_t stored_info;
+    bool has_stored = flash_storage_get_device_info(addr, &stored_info);
+    if (has_stored) {
+        if (stored_info.port == -1) {
+            appearance = UNI_BT_HID_APPEARANCE_KEYBOARD;
+        } else if (stored_info.default_mode == 1 || strstr(stored_info.name, "Mouse") != NULL || strstr(stored_info.friendly_name, "Mouse") != NULL || strstr(name, "Mouse") != NULL || strstr(name, "Canosa") != NULL || stored_info.port == 0) {
+            appearance = UNI_BT_HID_APPEARANCE_MOUSE;
+        } else if (appearance == 0) {
+            appearance = (stored_info.default_mode == 0 || stored_info.default_mode == 2 || stored_info.port == 1) ? UNI_BT_HID_APPEARANCE_GAMEPAD : UNI_BT_HID_APPEARANCE_MOUSE;
+        }
+        if (strlen(name) == 0 && strlen(stored_info.name) > 0) {
+            strncpy(name, stored_info.name, sizeof(name) - 1);
+            name[sizeof(name) - 1] = '\0';
+        }
+    } else if (appearance != UNI_BT_HID_APPEARANCE_GAMEPAD && appearance != UNI_BT_HID_APPEARANCE_JOYSTICK &&
         appearance != UNI_BT_HID_APPEARANCE_MOUSE && appearance != UNI_BT_HID_APPEARANCE_KEYBOARD) {
-        // Don't log it. There too many devices advertising themselves.
-        if (appearance != 0 || strlen(name) != 0)
-            logd("Not a HID controller, appearance: %#x, name =%s\n", appearance, name);
-        return;
+        if (uni_bt_allowlist_is_allowed_addr(addr)) {
+            if (strstr(name, "Key") != NULL || strstr(name, "KBD") != NULL) {
+                appearance = UNI_BT_HID_APPEARANCE_KEYBOARD;
+            } else {
+                appearance = UNI_BT_HID_APPEARANCE_MOUSE;
+            }
+        } else {
+            // Don't log it. There too many devices advertising themselves.
+            if (appearance != 0 || strlen(name) != 0)
+                logd("Not a HID controller, appearance: %#x, name =%s\n", appearance, name);
+            return;
+        }
     }
 
     switch (appearance) {
