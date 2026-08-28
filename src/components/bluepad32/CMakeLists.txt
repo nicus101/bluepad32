@@ -171,7 +171,7 @@ if(IDF_TARGET)
 elseif(PICO_SDK_VERSION_STRING)
     target_link_libraries(bluepad32
             pico_stdlib
-            pico_cyw43_arch_none
+            pico_cyw43_arch_lwip_threadsafe_background
             pico_btstack_ble
             pico_btstack_classic
             pico_btstack_cyw43

@@ -65,9 +65,11 @@
 
 #include "sdkconfig.h"
 
+#include "bt/uni_bt_allowlist.h"
 #include "bt/uni_bt_bredr.h"
 #include "bt/uni_bt_conn.h"
 #include "bt/uni_bt_defines.h"
+#include "flash_storage.h"
 #include "parser/uni_hid_parser.h"
 #include "uni_common.h"
 #include "uni_config.h"
@@ -75,12 +77,50 @@
 #include "uni_log.h"
 #include "uni_property.h"
 
+
 static bool is_scanning;
 static bool ble_enabled;
 
 // Temporal space for SDP in BLE
 static uint8_t hid_descriptor_storage[HID_MAX_DESCRIPTOR_LEN * CONFIG_BLUEPAD32_MAX_DEVICES];
 static btstack_packet_callback_registration_t sm_event_callback_registration;
+
+static const char* sm_pairing_reason_to_string(uint8_t reason) {
+    switch (reason) {
+        case SM_REASON_PASSKEY_ENTRY_FAILED:
+            return "passkey entry failed";
+        case SM_REASON_OOB_NOT_AVAILABLE:
+            return "out of band not available";
+        case SM_REASON_AUTHENTHICATION_REQUIREMENTS:
+            return "authentication requirements";
+        case SM_REASON_CONFIRM_VALUE_FAILED:
+            return "confirm value failed";
+        case SM_REASON_PAIRING_NOT_SUPPORTED:
+            return "pairing not supported";
+        case SM_REASON_ENCRYPTION_KEY_SIZE:
+            return "encryption key size";
+        case SM_REASON_COMMAND_NOT_SUPPORTED:
+            return "command not supported";
+        case SM_REASON_UNSPECIFIED_REASON:
+            return "unspecified";
+        case SM_REASON_REPEATED_ATTEMPTS:
+            return "repeated attempts";
+        case SM_REASON_INVALID_PARAMETERS:
+            return "invalid parameters";
+        case SM_REASON_DHKEY_CHECK_FAILED:
+            return "dhkey check failed";
+        case SM_REASON_NUMERIC_COMPARISON_FAILED:
+            return "numeric comparison failed";
+        case SM_REASON_BR_EDR_PAIRING_IN_PROGRESS:
+            return "br/edr pairing in progress";
+        case SM_REASON_CROSS_TRANSPORT_KEY_DERIVATION_NOT_ALLOWED:
+            return "cross transport key derivation not allowed";
+        case SM_REASON_KEY_REJECTED:
+            return "key rejected";
+        default:
+            return "unknown";
+    }
+}
 
 /**
  * Connect to remote device but set timer for timeout
@@ -211,79 +251,85 @@ static void adv_event_get_data(const uint8_t* packet, uint16_t* appearance, char
 }
 
 static const uint8_t s_default_boot_mouse_hid_descriptor[] = {
-    0x05, 0x01,        // Usage Page (Generic Desktop)
-    0x09, 0x02,        // Usage (Mouse)
-    0xA1, 0x01,        // Collection (Application)
-    0x85, 0x02,        //   Report ID (2) - matches HID_BOOT_MODE_MOUSE_ID
-    0x09, 0x01,        //   Usage (Pointer)
-    0xA1, 0x00,        //   Collection (Physical)
-    0x05, 0x09,        //     Usage Page (Buttons)
-    0x19, 0x01,        //     Usage Minimum (1)
-    0x29, 0x03,        //     Usage Maximum (3)
-    0x15, 0x00,        //     Logical Minimum (0)
-    0x25, 0x01,        //     Logical Maximum (1)
-    0x95, 0x03,        //     Report Count (3)
-    0x75, 0x01,        //     Report Size (1)
-    0x81, 0x02,        //     Input (Data, Variable, Absolute)
-    0x95, 0x01,        //     Report Count (1)
-    0x75, 0x05,        //     Report Size (5)
-    0x81, 0x01,        //     Input (Constant)
-    0x05, 0x01,        //     Usage Page (Generic Desktop)
-    0x09, 0x30,        //     Usage (X)
-    0x09, 0x31,        //     Usage (Y)
-    0x15, 0x81,        //     Logical Minimum (-127)
-    0x25, 0x7F,        //     Logical Maximum (127)
-    0x75, 0x08,        //     Report Size (8)
-    0x95, 0x02,        //     Report Count (2)
-    0x81, 0x06,        //     Input (Data, Variable, Relative)
-    0x09, 0x38,        //     Usage (Wheel)
-    0x15, 0x81,        //     Logical Minimum (-127)
-    0x25, 0x7F,        //     Logical Maximum (127)
-    0x75, 0x08,        //     Report Size (8)
-    0x95, 0x01,        //     Report Count (1)
-    0x81, 0x06,        //     Input (Data, Variable, Relative)
-    0xC0,              //   End Collection
-    0xC0               // End Collection
+    0x05, 0x01,  // Usage Page (Generic Desktop)
+    0x09, 0x02,  // Usage (Mouse)
+    0xA1, 0x01,  // Collection (Application)
+    0x85, 0x02,  //   Report ID (2) - matches HID_BOOT_MODE_MOUSE_ID
+    0x09, 0x01,  //   Usage (Pointer)
+    0xA1, 0x00,  //   Collection (Physical)
+    0x05, 0x09,  //     Usage Page (Buttons)
+    0x19, 0x01,  //     Usage Minimum (1)
+    0x29, 0x03,  //     Usage Maximum (3)
+    0x15, 0x00,  //     Logical Minimum (0)
+    0x25, 0x01,  //     Logical Maximum (1)
+    0x95, 0x03,  //     Report Count (3)
+    0x75, 0x01,  //     Report Size (1)
+    0x81, 0x02,  //     Input (Data, Variable, Absolute)
+    0x95, 0x01,  //     Report Count (1)
+    0x75, 0x05,  //     Report Size (5)
+    0x81, 0x01,  //     Input (Constant)
+    0x05, 0x01,  //     Usage Page (Generic Desktop)
+    0x09, 0x30,  //     Usage (X)
+    0x09, 0x31,  //     Usage (Y)
+    0x15, 0x81,  //     Logical Minimum (-127)
+    0x25, 0x7F,  //     Logical Maximum (127)
+    0x75, 0x08,  //     Report Size (8)
+    0x95, 0x02,  //     Report Count (2)
+    0x81, 0x06,  //     Input (Data, Variable, Relative)
+    0x09, 0x38,  //     Usage (Wheel)
+    0x15, 0x81,  //     Logical Minimum (-127)
+    0x25, 0x7F,  //     Logical Maximum (127)
+    0x75, 0x08,  //     Report Size (8)
+    0x95, 0x01,  //     Report Count (1)
+    0x81, 0x06,  //     Input (Data, Variable, Relative)
+    0xC0,        //   End Collection
+    0xC0         // End Collection
 };
 
 static const uint8_t s_default_boot_keyboard_hid_descriptor[] = {
-    0x05, 0x01,        // Usage Page (Generic Desktop)
-    0x09, 0x06,        // Usage (Keyboard)
-    0xA1, 0x01,        // Collection (Application)
-    0x85, 0x01,        //   Report ID (1) - matches HID_BOOT_MODE_KEYBOARD_ID
-    0x05, 0x07,        //   Usage Page (Key Codes)
-    0x19, 0xE0,        //   Usage Minimum (224 / Left Control)
-    0x29, 0xE7,        //   Usage Maximum (231 / Right GUI)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x01,        //   Logical Maximum (1)
-    0x75, 0x01,        //   Report Size (1)
-    0x95, 0x08,        //   Report Count (8)
-    0x81, 0x02,        //   Input (Data, Variable, Absolute)
-    0x95, 0x01,        //   Report Count (1)
-    0x75, 0x08,        //   Report Size (8)
-    0x81, 0x01,        //   Input (Constant)
-    0x95, 0x06,        //   Report Count (6)
-    0x75, 0x08,        //   Report Size (8)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x25, 0x65,        //   Logical Maximum (101)
-    0x05, 0x07,        //   Usage Page (Key Codes)
-    0x19, 0x00,        //   Usage Minimum (0)
-    0x29, 0x65,        //   Usage Maximum (101)
-    0x81, 0x00,        //   Input (Data, Array)
-    0xC0               // End Collection
+    0x05, 0x01,  // Usage Page (Generic Desktop)
+    0x09, 0x06,  // Usage (Keyboard)
+    0xA1, 0x01,  // Collection (Application)
+    0x85, 0x01,  //   Report ID (1) - matches HID_BOOT_MODE_KEYBOARD_ID
+    0x05, 0x07,  //   Usage Page (Key Codes)
+    0x19, 0xE0,  //   Usage Minimum (224 / Left Control)
+    0x29, 0xE7,  //   Usage Maximum (231 / Right GUI)
+    0x15, 0x00,  //   Logical Minimum (0)
+    0x25, 0x01,  //   Logical Maximum (1)
+    0x75, 0x01,  //   Report Size (1)
+    0x95, 0x08,  //   Report Count (8)
+    0x81, 0x02,  //   Input (Data, Variable, Absolute)
+    0x95, 0x01,  //   Report Count (1)
+    0x75, 0x08,  //   Report Size (8)
+    0x81, 0x01,  //   Input (Constant)
+    0x95, 0x06,  //   Report Count (6)
+    0x75, 0x08,  //   Report Size (8)
+    0x15, 0x00,  //   Logical Minimum (0)
+    0x25, 0x65,  //   Logical Maximum (101)
+    0x05, 0x07,  //   Usage Page (Key Codes)
+    0x19, 0x00,  //   Usage Minimum (0)
+    0x29, 0x65,  //   Usage Maximum (101)
+    0x81, 0x00,  //   Input (Data, Array)
+    0xC0         // End Collection
 };
 
 static bool is_le_mouse(const uni_hid_device_t* d) {
-    if (!d) return false;
-    if (uni_hid_device_is_mouse(d)) return true;
-    if (d->name[0] != 0 && (strstr(d->name, "Mouse") != NULL || strstr(d->name, "mouse") != NULL)) return true;
+    if (!d)
+        return false;
+    if (uni_hid_device_is_mouse(d))
+        return true;
+    if (d->name[0] != 0 && (strstr(d->name, "Mouse") != NULL || strstr(d->name, "mouse") != NULL))
+        return true;
     return false;
 }
 
 static bool is_le_keyboard(const uni_hid_device_t* d) {
-    if (!d) return false;
-    if (uni_hid_device_is_keyboard(d)) return true;
-    if (d->name[0] != 0 && (strstr(d->name, "Keyboard") != NULL || strstr(d->name, "keyboard") != NULL)) return true;
+    if (!d)
+        return false;
+    if (uni_hid_device_is_keyboard(d))
+        return true;
+    if (d->name[0] != 0 && (strstr(d->name, "Keyboard") != NULL || strstr(d->name, "keyboard") != NULL))
+        return true;
     return false;
 }
 
@@ -307,7 +353,8 @@ static void parse_report(const uint8_t* packet, uint16_t size) {
         return;
     }
 
-    logi("[UNI_BT_LE] parse_report: hids_cid=%d, service_index=%d, desc_len=%d\n", hids_cid, service_index, device->hid_descriptor_len);
+    logi("[UNI_BT_LE] parse_report: hids_cid=%d, service_index=%d, desc_len=%d\n", hids_cid, service_index,
+         device->hid_descriptor_len);
 
     // Copy HID descriptor or use default boot descriptor if unavailable
     if (device->hid_descriptor_len == 0) {
@@ -332,6 +379,8 @@ static void parse_report(const uint8_t* packet, uint16_t size) {
     }
     report_data = gattservice_subevent_hid_report_get_report(packet);
     report_len = gattservice_subevent_hid_report_get_report_len(packet);
+
+    logi("HID report: hids_cid=%d service_index=%d len=%d\n", hids_cid, service_index, report_len);
 
     uni_hid_parse_input_report(device, report_data, report_len);
     uni_hid_device_process_controller(device);
@@ -391,13 +440,12 @@ static void uni_hids_client_packet_handler(uint8_t packet_type, uint16_t channel
                         loge("Hids Cid: Could not find valid device for hids_cid=%d\n", hids_cid);
                         break;
                     }
-#if 0
+
                     status = hids_client_enable_notifications(hids_cid);
                     if (status != ERROR_CODE_SUCCESS)
                         logi("Failed to enable client notifications for hids_cid=%d, status=%#x\n", hids_cid, status);
                     else
-                        logi("Client notifications enabled for for hids_cid=%d\n", hids_cid);
-#endif
+                        logi("Client notifications enabled for hids_cid=%d\n", hids_cid);
 
                     uni_hid_device_guess_controller_type_from_pid_vid(device);
                     uni_hid_device_connect(device);
@@ -497,6 +545,7 @@ static void uni_device_information_packet_handler(uint8_t packet_type,
     hci_con_handle_t con_handle;
     uni_hid_device_t* device;
     uint8_t event_type;
+    uint16_t hids_cid = 0;
 
     UNUSED(channel);
     UNUSED(size);
@@ -526,7 +575,9 @@ static void uni_device_information_packet_handler(uint8_t packet_type,
             status = gattservice_subevent_device_information_done_get_att_status(packet);
             con_handle = gattservice_subevent_device_information_done_get_con_handle(packet);
             switch (status) {
-                case ERROR_CODE_SUCCESS:
+                case ERROR_CODE_SUCCESS: {
+                    hid_protocol_mode_t requested_protocol_mode;
+
                     logi("Device Information service found\n");
                     device = uni_hid_device_get_instance_for_connection_handle(con_handle);
                     if (!device) {
@@ -534,13 +585,38 @@ static void uni_device_information_packet_handler(uint8_t packet_type,
                         break;
                     }
 
-                    // Defer HIDS connect slightly (50ms) so GATT client state machine completes DIS and is ready
-                    btstack_run_loop_remove_timer(&hids_connect_timer);
-                    btstack_run_loop_set_timer_context(&hids_connect_timer, (void*)(uintptr_t)con_handle);
-                    btstack_run_loop_set_timer_handler(&hids_connect_timer, &hids_connect_timer_handler);
-                    btstack_run_loop_set_timer(&hids_connect_timer, 50);
-                    btstack_run_loop_add_timer(&hids_connect_timer);
-                    break;
+                    if (!uni_hid_device_has_name(device)) {
+                        gamepad_info_t info;
+                        if (flash_storage_get_device_info(device->conn.btaddr, &info) && strlen(info.name) > 0) {
+                            uni_hid_device_set_name(device, info.name);
+                            uni_hid_device_guess_controller_type_from_name(device, device->name);
+                        }
+                    }
+
+                    // Some BLE keyboards and mice fail during REPORT mode setup but work in BOOT mode.
+                    requested_protocol_mode = (uni_hid_device_is_keyboard(device) || uni_hid_device_is_mouse(device))
+                                                  ? HID_PROTOCOL_MODE_BOOT
+                                                  : HID_PROTOCOL_MODE_REPORT;
+
+                    // Continue - query primary services.
+                    logi("Search for HID service, con_handle: %#x, protocol_mode=%d\n", con_handle,
+                         requested_protocol_mode);
+                    status = hids_client_connect(con_handle, uni_hids_client_packet_handler, requested_protocol_mode,
+                                                 &hids_cid);
+                    if (status == ERROR_CODE_COMMAND_DISALLOWED) {
+                        logi("HID client connection failed with COMMAND_DISALLOWED, ignoring \n");
+                        // Means that a HIDS client connection is already present.
+                        // We forgot to delete it.
+                        // hids_client_disconnect(con_handle);
+                    }
+                    if (status != ERROR_CODE_SUCCESS) {
+                        logi("HID client connection failed, status=%#x\n", status);
+                        hog_disconnect(con_handle);
+                        break;
+                    }
+                    logi("Using hids_cid=%d\n", hids_cid);
+                    device->hids_cid = hids_cid;
+                } break;
                 default:
                     logi("Device Information service client connection failed, error=%#x.\n", status);
                     hog_disconnect(con_handle);
@@ -696,10 +772,14 @@ static void uni_sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t
         case SM_EVENT_NUMERIC_COMPARISON_REQUEST:
             logi("Confirming numeric comparison: %" PRIu32 "\n",
                  sm_event_numeric_comparison_request_get_passkey(packet));
-            sm_numeric_comparison_confirm(sm_event_passkey_display_number_get_handle(packet));
+            sm_numeric_comparison_confirm(sm_event_numeric_comparison_request_get_handle(packet));
             break;
         case SM_EVENT_PASSKEY_DISPLAY_NUMBER:
-            logi("Display Passkey: %" PRIu32 "\n", sm_event_passkey_display_number_get_passkey(packet));
+            logi("Display Passkey: %" PRIu32 " (type it on the keyboard)\n",
+                 sm_event_passkey_display_number_get_passkey(packet));
+            break;
+        case SM_EVENT_PASSKEY_INPUT_NUMBER:
+            loge("Passkey input requested on host. This build has no host keypad UI; pairing cannot proceed.\n");
             break;
         case SM_EVENT_IDENTITY_RESOLVING_STARTED:
             logi("SM_EVENT_IDENTITY_RESOLVING_STARTED\n");
@@ -777,7 +857,16 @@ static void uni_sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t
                     logi("Pairing failed, disconnected\n");
                     break;
                 case ERROR_CODE_AUTHENTICATION_FAILURE:
-                    logi("Pairing failed, reason = %u\n", sm_event_pairing_complete_get_reason(packet));
+                    logi("Pairing failed, reason = %u (%s)\n", sm_event_pairing_complete_get_reason(packet),
+                         sm_pairing_reason_to_string(sm_event_pairing_complete_get_reason(packet)));
+                    // Some BLE keyboards don't support explicit host-initiated SMP pairing.
+                    // Ignore this for keyboards: service discovery is already started from
+                    // LE connection complete, and re-requesting it here races with the
+                    // ongoing query (ERROR_CODE_COMMAND_DISALLOWED = 0x0c).
+                    if (sm_event_pairing_complete_get_reason(packet) == SM_REASON_PAIRING_NOT_SUPPORTED &&
+                        uni_hid_device_is_keyboard(device)) {
+                        logi("Keyboard reports pairing not supported; waiting for ongoing service discovery\n");
+                    }
                     break;
                 default:
                     loge("Unknown paring status: %#x\n", status);
@@ -803,7 +892,9 @@ static void uni_sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t
         }
         logi("Requesting device information\n");
         status = device_information_service_client_query(con_handle, uni_device_information_packet_handler);
-        if (status != ERROR_CODE_SUCCESS) {
+        if (status == ERROR_CODE_COMMAND_DISALLOWED) {
+            logi("Device information query already in progress\n");
+        } else if (status != ERROR_CODE_SUCCESS) {
             loge("Failed to set device information client: %#x\n", status);
         }
     }
@@ -831,7 +922,19 @@ void uni_bt_le_on_hci_event_le_meta(const uint8_t* packet, uint16_t size) {
             logi("Using con_handle: %#x\n", con_handle);
 
             uni_hid_device_set_connection_handle(device, con_handle);
-            sm_request_pairing(con_handle);
+
+            if (uni_hid_device_is_keyboard(device)) {
+                uint8_t status;
+                logi("BLE keyboard detected: skipping forced SMP pairing and querying services\n");
+                status = device_information_service_client_query(con_handle, uni_device_information_packet_handler);
+                if (status == ERROR_CODE_COMMAND_DISALLOWED) {
+                    logi("Device information query already in progress\n");
+                } else if (status != ERROR_CODE_SUCCESS) {
+                    loge("Failed to set device information client: %#x\n", status);
+                }
+            } else {
+                sm_request_pairing(con_handle);
+            }
 
             // Resume scanning
             // gap_start_scan();
@@ -898,12 +1001,38 @@ void uni_bt_le_on_gap_event_advertising_report(const uint8_t* packet, uint16_t s
 
     adv_event_get_data(packet, &appearance, name);
 
-    if (appearance != UNI_BT_HID_APPEARANCE_GAMEPAD && appearance != UNI_BT_HID_APPEARANCE_JOYSTICK &&
-        appearance != UNI_BT_HID_APPEARANCE_MOUSE && appearance != UNI_BT_HID_APPEARANCE_KEYBOARD) {
-        // Don't log it. There too many devices advertising themselves.
-        if (appearance != 0 || strlen(name) != 0)
-            logd("Not a HID controller, appearance: %#x, name =%s\n", appearance, name);
-        return;
+    gamepad_info_t stored_info;
+    bool has_stored = flash_storage_get_device_info(addr, &stored_info);
+    if (has_stored) {
+        if (stored_info.port == -1) {
+            appearance = UNI_BT_HID_APPEARANCE_KEYBOARD;
+        } else if (stored_info.default_mode == 1 || strstr(stored_info.name, "Mouse") != NULL ||
+                   strstr(stored_info.friendly_name, "Mouse") != NULL || strstr(name, "Mouse") != NULL ||
+                   strstr(name, "Canosa") != NULL || stored_info.port == 0) {
+            appearance = UNI_BT_HID_APPEARANCE_MOUSE;
+        } else if (appearance == 0) {
+            appearance = (stored_info.default_mode == 0 || stored_info.default_mode == 2 || stored_info.port == 1)
+                             ? UNI_BT_HID_APPEARANCE_GAMEPAD
+                             : UNI_BT_HID_APPEARANCE_MOUSE;
+        }
+        if (strlen(name) == 0 && strlen(stored_info.name) > 0) {
+            strncpy(name, stored_info.name, sizeof(name) - 1);
+            name[sizeof(name) - 1] = '\0';
+        }
+    } else if (appearance != UNI_BT_HID_APPEARANCE_GAMEPAD && appearance != UNI_BT_HID_APPEARANCE_JOYSTICK &&
+               appearance != UNI_BT_HID_APPEARANCE_MOUSE && appearance != UNI_BT_HID_APPEARANCE_KEYBOARD) {
+        if (uni_bt_allowlist_is_allowed_addr(addr)) {
+            if (strstr(name, "Key") != NULL || strstr(name, "KBD") != NULL) {
+                appearance = UNI_BT_HID_APPEARANCE_KEYBOARD;
+            } else {
+                appearance = UNI_BT_HID_APPEARANCE_MOUSE;
+            }
+        } else {
+            // Don't log it. There too many devices advertising themselves.
+            if (appearance != 0 || strlen(name) != 0)
+                logd("Not a HID controller, appearance: %#x, name =%s\n", appearance, name);
+            return;
+        }
     }
 
     switch (appearance) {
@@ -1016,6 +1145,7 @@ void uni_bt_le_setup(void) {
     le_device_db_init();
 
     sm_init();
+    // Prefer Just Works so BLE keyboards don't require manual passkey entry.
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
 
     // TL;DR:
@@ -1028,7 +1158,9 @@ void uni_bt_le_setup(void) {
     // - Xbox 2 buttons: flaky, fails to connect or connects
     // sm_set_authentication_requirements(0);
 
-    sm_set_authentication_requirements(SM_AUTHREQ_BONDING);
+    // Compatibility mode: some BLE keyboards reject SMP pairing entirely.
+    // Allow unbonded operation and let protected characteristics request auth if needed.
+    sm_set_authentication_requirements(SM_AUTHREQ_NO_BONDING);
 
     // Secure connection + NO bonding in ESP32:
     // - Stadia: Ok

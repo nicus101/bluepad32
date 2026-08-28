@@ -22,6 +22,7 @@ static void update_allowlist_to_property(void) {
     // Example of a list of two elements:
     // 00:22:33:44:55:66,11:AB:8B:99:44:8A
     uni_property_value_t val;
+
     static char str[512];
     int pos = 0;
 

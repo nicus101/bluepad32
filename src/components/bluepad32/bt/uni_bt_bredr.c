@@ -15,10 +15,13 @@
 #include "bt/uni_bt_allowlist.h"
 #include "bt/uni_bt_defines.h"
 #include "bt/uni_bt_sdp.h"
+#include "flash_storage.h"
+#include "parser/uni_hid_parser_switch.h"
 #include "platform/uni_platform.h"
 #include "uni_common.h"
 #include "uni_config.h"
 #include "uni_log.h"
+
 
 // These are the only two supported platforms with BR/EDR support.
 #if !(defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_TARGET_POSIX) || defined(CONFIG_TARGET_PICO_W))
@@ -29,6 +32,28 @@
 _Static_assert(INQUIRY_REMOTE_NAME_TIMEOUT_MS < HID_DEVICE_CONNECTION_TIMEOUT_MS, "Timeout too big");
 
 static bool bt_bredr_enabled = true;
+
+static bool device_requires_host_l2cap(const uni_hid_device_t* d) {
+    if (d == NULL)
+        return false;
+    if (!uni_hid_device_is_incoming(d))
+        return true;
+    if (uni_hid_device_is_mouse(d) || uni_hid_device_is_keyboard(d))
+        return false;
+    // Nintendo Switch / Wii / JoyCon controllers and other gamepads that expect host to initiate L2CAP
+    if (d->controller_type == CONTROLLER_TYPE_SwitchProController ||
+        d->controller_type == CONTROLLER_TYPE_SwitchJoyConLeft ||
+        d->controller_type == CONTROLLER_TYPE_SwitchJoyConRight ||
+        d->controller_type == CONTROLLER_TYPE_SwitchJoyConPair ||
+        d->controller_type == CONTROLLER_TYPE_WiiController ||
+        (d->name[0] != 0 && (strstr(d->name, "Pro Controller") != NULL ||
+                             strstr(d->name, "Joy-Con") != NULL ||
+                             strstr(d->name, "Nintendo") != NULL ||
+                             strstr(d->name, "Wireless Controller") != NULL))) {
+        return true;
+    }
+    return false;
+}
 
 static void l2cap_create_control_connection(uni_hid_device_t* d) {
     uint8_t status;
@@ -61,23 +86,32 @@ static void inquiry_remote_name_timeout_callback(btstack_timer_source_t* ts) {
     uni_bt_bredr_process_fsm(d);
 }
 
+static bool s_bredr_scanning = false;
+
 void uni_bt_bredr_scan_start(void) {
+    if (s_bredr_scanning)
+        return;
     uint8_t status;
 
     status = gap_inquiry_periodic_start(uni_bt_get_gap_inquiry_length(), uni_bt_get_gap_max_periodic_length(),
                                         uni_bt_get_gap_min_periodic_length());
     if (status)
         loge("Failed to start period inquiry, error=0x%02x\n", status);
+    else
+        s_bredr_scanning = true;
     logi("BR/EDR scan -> 1\n");
 }
 
 void uni_bt_bredr_scan_stop(void) {
+    if (!s_bredr_scanning)
+        return;
     uint8_t status;
 
     status = gap_inquiry_stop();
     if (status)
         loge("Error: cannot stop inquiry (0x%02x), please try again\n", status);
 
+    s_bredr_scanning = false;
     logi("BR/EDR scan -> 0\n");
 }
 
@@ -151,6 +185,10 @@ void uni_bt_bredr_setup(void) {
     gap_set_security_level(security_level);
 
     gap_connectable_control(1);
+    gap_set_bondable_mode(1);
+    gap_ssp_set_io_capability(SSP_IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    gap_ssp_set_authentication_requirement(SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
+    gap_ssp_set_auto_accept(1);
 
     // Enable once we add support for "BP32 BT Service"
     gap_discoverable_control(0);
@@ -177,7 +215,7 @@ void uni_bt_bredr_setup(void) {
     // try to become master on incoming connections
     hci_set_master_slave_policy(HCI_ROLE_MASTER);
 
-    logi("Gap security level: %d\n", security_level);
+    logi("Gap security level: %d (Bondable: 1, IO Cap: NoInputNoOutput)\n", security_level);
     logi("Periodic Inquiry: max=%d, min=%d, len=%d\n", uni_bt_get_gap_max_periodic_length(),
          uni_bt_get_gap_min_periodic_length(), uni_bt_get_gap_inquiry_length());
 }
@@ -255,6 +293,16 @@ void uni_bt_bredr_process_fsm(uni_hid_device_t* d) {
             uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_SDP_HID_DESCRIPTOR_FETCHED);
         }
 
+        if (d->conn.control_cid == 0) {
+            if (device_requires_host_l2cap(d)) {
+                logi("uni_bt_process_fsm: Starting L2CAP connection\n");
+                l2cap_create_control_connection(d);
+            } else {
+                logi("uni_bt_process_fsm: Incoming device, waiting for incoming L2CAP\n");
+            }
+            return;
+        }
+
         if (uni_hid_device_is_incoming(d)) {
             if (d->sdp_query_type == SDP_QUERY_NOT_NEEDED) {
                 if (d->conn.control_cid != 0 && d->conn.interrupt_cid != 0) {
@@ -270,9 +318,6 @@ void uni_bt_bredr_process_fsm(uni_hid_device_t* d) {
             }
             return;
         }
-        // else, not an incoming connection
-        logi("uni_bt_process_fsm: Starting L2CAP connection\n");
-        l2cap_create_control_connection(d);
         return;
     }
 
@@ -283,10 +328,23 @@ void uni_bt_bredr_process_fsm(uni_hid_device_t* d) {
     }
 
     if (state == UNI_BT_CONN_STATE_SDP_HID_DESCRIPTOR_FETCHED) {
+        if (d->conn.control_cid == 0) {
+            if (device_requires_host_l2cap(d)) {
+                logi("uni_bt_process_fsm: Starting L2CAP connection\n");
+                l2cap_create_control_connection(d);
+            } else {
+                logi("uni_bt_process_fsm: Incoming device, waiting for incoming L2CAP\n");
+            }
+            return;
+        }
+
         if (uni_hid_device_is_incoming(d)) {
             if (d->conn.control_cid != 0 && d->conn.interrupt_cid != 0) {
                 logi("uni_bt_process_fsm: Device is ready\n");
                 uni_hid_device_set_ready(d);
+            } else if (device_requires_host_l2cap(d) && d->conn.interrupt_cid == 0) {
+                logi("uni_bt_process_fsm: Create L2CAP interrupt connection\n");
+                l2cap_create_interrupt_connection(d);
             } else {
                 logi("uni_bt_process_fsm: waiting for incoming L2CAP channels\n");
             }
@@ -305,7 +363,7 @@ void uni_bt_bredr_process_fsm(uni_hid_device_t* d) {
     }
 
     if (state == UNI_BT_CONN_STATE_L2CAP_CONTROL_CONNECTED) {
-        if (!uni_hid_device_is_incoming(d) && d->conn.interrupt_cid == 0) {
+        if (d->conn.interrupt_cid == 0 && device_requires_host_l2cap(d)) {
             logi("uni_bt_process_fsm: Create L2CAP interrupt connection\n");
             l2cap_create_interrupt_connection(d);
             return;
@@ -383,6 +441,18 @@ void uni_bt_bredr_on_l2cap_incoming_connection(uint16_t channel, const uint8_t* 
 
     switch (psm) {
         case PSM_HID_CONTROL:
+            if (device != NULL && device->conn.control_cid != 0) {
+                if (device->conn.state == UNI_BT_CONN_STATE_L2CAP_CONTROL_CONNECTION_REQUESTED) {
+                    logi("Adopting incoming PSM_HID_CONTROL 0x%04x over pending outgoing 0x%04x\n", channel,
+                         device->conn.control_cid);
+                    device->conn.control_cid = channel;
+                } else {
+                    logi("Declining duplicate incoming PSM_HID_CONTROL 0x%04x (existing: 0x%04x)\n", channel,
+                         device->conn.control_cid);
+                    l2cap_decline_connection(channel);
+                    break;
+                }
+            }
             if (device == NULL) {
                 device = uni_hid_device_create(event_addr);
                 if (device == NULL) {
@@ -391,6 +461,14 @@ void uni_bt_bredr_on_l2cap_incoming_connection(uint16_t channel, const uint8_t* 
                     break;
                 }
             }
+            if (!uni_hid_device_has_name(device)) {
+                gamepad_info_t info;
+                if (flash_storage_get_device_info(device->conn.btaddr, &info) && strlen(info.name) > 0) {
+                    logi("Restored cached device name '%s' for %s\n", info.name, bd_addr_to_str(device->conn.btaddr));
+                    uni_hid_device_set_name(device, info.name);
+                }
+            }
+            uni_hid_device_guess_controller_type_from_name(device, device->name);
             l2cap_accept_connection(channel);
             uni_hid_device_set_connection_handle(device, handle);
             if (device->conn.control_cid == 0) {
@@ -399,6 +477,18 @@ void uni_bt_bredr_on_l2cap_incoming_connection(uint16_t channel, const uint8_t* 
             uni_hid_device_set_incoming(device, true);
             break;
         case PSM_HID_INTERRUPT:
+            if (device != NULL && device->conn.interrupt_cid != 0) {
+                if (device->conn.state == UNI_BT_CONN_STATE_L2CAP_INTERRUPT_CONNECTION_REQUESTED) {
+                    logi("Adopting incoming PSM_HID_INTERRUPT 0x%04x over pending outgoing 0x%04x\n", channel,
+                         device->conn.interrupt_cid);
+                    device->conn.interrupt_cid = channel;
+                } else {
+                    logi("Declining duplicate incoming PSM_HID_INTERRUPT 0x%04x (existing: 0x%04x)\n", channel,
+                         device->conn.interrupt_cid);
+                    l2cap_decline_connection(channel);
+                    break;
+                }
+            }
             if (device == NULL) {
                 loge("Could not find device for PSM_HID_INTERRUPT = 0x%04x\n", channel);
                 l2cap_decline_connection(channel);
@@ -569,7 +659,10 @@ void uni_bt_bredr_on_gap_inquiry_result(uint16_t channel, const uint8_t* packet,
         name_buffer[name_len] = 0;
         logi(", name '%s'", name_buffer);
     }
-    logi("\n");
+    if (uni_bt_allowlist_is_enabled()) {
+        // Allowlist is enabled outside pairing mode. Bonded BR/EDR devices connect via incoming connections.
+        return;
+    }
 
     supported = uni_hid_device_on_device_discovered(addr, name_buffer, cod, rssi) == UNI_ERROR_SUCCESS;
     if (supported) {
@@ -614,6 +707,11 @@ void uni_bt_bredr_on_hci_connection_request(uint16_t channel, const uint8_t* pac
     hci_event_connection_request_get_bd_addr(packet, event_addr);
     cod = hci_event_connection_request_get_class_of_device(packet);
 
+    if (!uni_bt_allowlist_is_allowed_addr(event_addr)) {
+        logi("Declining HCI connection request from unauthorized device: %s\n", bd_addr_to_str(event_addr));
+        return;
+    }
+
     d = uni_hid_device_get_instance_for_address(event_addr);
     if (d == NULL) {
         d = uni_hid_device_create(event_addr);
@@ -652,9 +750,14 @@ void uni_bt_bredr_on_hci_connection_complete(uint16_t channel, const uint8_t* pa
     handle = hci_event_connection_complete_get_connection_handle(packet);
     uni_hid_device_set_connection_handle(d, handle);
 
-    // if (uni_hid_device_is_incoming(d)) {
-    //   hci_send_cmd(&hci_authentication_requested, handle);
-    // }
+    if (!uni_hid_device_has_name(d)) {
+        gamepad_info_t info;
+        if (flash_storage_get_device_info(d->conn.btaddr, &info) && strlen(info.name) > 0) {
+            logi("Restored cached device name '%s' for %s\n", info.name, bd_addr_to_str(d->conn.btaddr));
+            uni_hid_device_set_name(d, info.name);
+            uni_hid_device_guess_controller_type_from_name(d, d->name);
+        }
+    }
 
     uint32_t cod = d->cod;
     bool is_keyboard = ((cod & UNI_BT_COD_MAJOR_MASK) == UNI_BT_COD_MAJOR_PERIPHERAL) && (cod & UNI_BT_COD_MINOR_MASK);
@@ -671,8 +774,19 @@ void uni_bt_bredr_on_hci_authentication_complete(hci_con_handle_t handle) {
         logi("uni_bt_bredr_on_hci_authentication_complete: device not found for handle 0x%04x\n", handle);
         return;
     }
-    logi("uni_bt_bredr_on_hci_authentication_complete: device %s, incoming=%d, control_cid=0x%04x, state=%d\n",
-         bd_addr_to_str(d->conn.btaddr), uni_hid_device_is_incoming(d), d->conn.control_cid,
+
+    if (!uni_hid_device_has_name(d)) {
+        gamepad_info_t info;
+        if (flash_storage_get_device_info(d->conn.btaddr, &info) && strlen(info.name) > 0) {
+            logi("Restored cached device name '%s' for %s\n", info.name, bd_addr_to_str(d->conn.btaddr));
+            uni_hid_device_set_name(d, info.name);
+            uni_hid_device_guess_controller_type_from_name(d, d->name);
+        }
+    }
+
+    gap_security_level_t sec = gap_security_level(handle);
+    logi("uni_bt_bredr_on_hci_authentication_complete: device %s, incoming=%d, control_cid=0x%04x, sec=%d, state=%d\n",
+         bd_addr_to_str(d->conn.btaddr), uni_hid_device_is_incoming(d), d->conn.control_cid, sec,
          uni_bt_conn_get_state(&d->conn));
 
     if (uni_hid_device_is_incoming(d)) {
@@ -685,13 +799,38 @@ void uni_bt_bredr_on_hci_authentication_complete(hci_con_handle_t handle) {
                 gap_remote_name_request(d->conn.btaddr, 0x02, 0x0000);
 
             uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_INQUIRED);
-        } else {
+        } else if (sec >= LEVEL_2) {
             uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
             uni_bt_bredr_process_fsm(d);
+        } else {
+            logi("uni_bt_bredr_on_hci_authentication_complete: waiting for encryption change before L2CAP\n");
         }
     } else if (d->conn.control_cid == 0) {
         logi("uni_bt_bredr_on_hci_authentication_complete: starting L2CAP control connection\n");
         l2cap_create_control_connection(d);
+    }
+}
+
+void uni_bt_bredr_on_hci_encryption_change(hci_con_handle_t handle, uint8_t enc_enabled) {
+    if (!enc_enabled)
+        return;
+    uni_hid_device_t* d = uni_hid_device_get_instance_for_connection_handle(handle);
+    if (!d)
+        return;
+
+    if (!uni_hid_device_has_name(d)) {
+        gamepad_info_t info;
+        if (flash_storage_get_device_info(d->conn.btaddr, &info) && strlen(info.name) > 0) {
+            logi("Restored cached device name '%s' for %s\n", info.name, bd_addr_to_str(d->conn.btaddr));
+            uni_hid_device_set_name(d, info.name);
+            uni_hid_device_guess_controller_type_from_name(d, d->name);
+        }
+    }
+
+    if (uni_hid_device_is_incoming(d) && d->conn.control_cid == 0 && device_requires_host_l2cap(d)) {
+        logi("uni_bt_bredr_on_hci_encryption_change: starting L2CAP connection after encryption enabled\n");
+        uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
+        uni_bt_bredr_process_fsm(d);
     }
 }
 
