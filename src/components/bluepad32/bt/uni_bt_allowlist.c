@@ -22,8 +22,8 @@ static void update_allowlist_to_property(void) {
     // Example of a list of two elements:
     // 00:22:33:44:55:66,11:AB:8B:99:44:8A
     uni_property_value_t val;
-
-    char str[128];
+    static char str[512];
+    int pos = 0;
 
     str[0] = 0;
 
@@ -31,9 +31,9 @@ static void update_allowlist_to_property(void) {
         if (bd_addr_cmp(addr_allow_list[i], zero_addr) == 0)
             continue;
         char* tmp_str = bd_addr_to_str(addr_allow_list[i]);
-        strcat(str, tmp_str);
-        // Append delimeter between addresses
-        strcat(str, ",");
+        if (pos + 20 < (int)sizeof(str)) {
+            pos += snprintf(str + pos, sizeof(str) - pos, "%s,", tmp_str);
+        }
     }
 
     val.str = str;

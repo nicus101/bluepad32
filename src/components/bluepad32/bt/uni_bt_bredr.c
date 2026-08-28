@@ -257,8 +257,12 @@ void uni_bt_bredr_process_fsm(uni_hid_device_t* d) {
 
         if (uni_hid_device_is_incoming(d)) {
             if (d->sdp_query_type == SDP_QUERY_NOT_NEEDED) {
-                logi("uni_bt_process_fsm: Device is ready\n");
-                uni_hid_device_set_ready(d);
+                if (d->conn.control_cid != 0 && d->conn.interrupt_cid != 0) {
+                    logi("uni_bt_process_fsm: Device is ready\n");
+                    uni_hid_device_set_ready(d);
+                } else {
+                    logi("uni_bt_process_fsm: waiting for incoming L2CAP channels\n");
+                }
             } else {
                 logi("uni_bt_process_fsm: starting SDP query\n");
                 uni_bt_sdp_query_start(d);
@@ -280,7 +284,12 @@ void uni_bt_bredr_process_fsm(uni_hid_device_t* d) {
 
     if (state == UNI_BT_CONN_STATE_SDP_HID_DESCRIPTOR_FETCHED) {
         if (uni_hid_device_is_incoming(d)) {
-            uni_hid_device_set_ready(d);
+            if (d->conn.control_cid != 0 && d->conn.interrupt_cid != 0) {
+                logi("uni_bt_process_fsm: Device is ready\n");
+                uni_hid_device_set_ready(d);
+            } else {
+                logi("uni_bt_process_fsm: waiting for incoming L2CAP channels\n");
+            }
             return;
         }
 
@@ -295,28 +304,30 @@ void uni_bt_bredr_process_fsm(uni_hid_device_t* d) {
         return;
     }
 
-    if (!uni_hid_device_is_incoming(d)) {
-        if (state == UNI_BT_CONN_STATE_L2CAP_CONTROL_CONNECTED) {
+    if (state == UNI_BT_CONN_STATE_L2CAP_CONTROL_CONNECTED) {
+        if (!uni_hid_device_is_incoming(d) && d->conn.interrupt_cid == 0) {
             logi("uni_bt_process_fsm: Create L2CAP interrupt connection\n");
             l2cap_create_interrupt_connection(d);
             return;
         }
+    }
 
-        if (state == UNI_BT_CONN_STATE_L2CAP_INTERRUPT_CONNECTED) {
-            switch (d->sdp_query_type) {
-                case SDP_QUERY_BEFORE_CONNECT:
-                case SDP_QUERY_NOT_NEEDED:
+    if (state == UNI_BT_CONN_STATE_L2CAP_INTERRUPT_CONNECTED) {
+        switch (d->sdp_query_type) {
+            case SDP_QUERY_BEFORE_CONNECT:
+            case SDP_QUERY_NOT_NEEDED:
+                if (uni_hid_device_has_name(d)) {
                     logi("uni_bt_process_fsm: Device is ready\n");
                     uni_hid_device_set_ready(d);
-                    break;
-                case SDP_QUERY_AFTER_CONNECT:
-                    logi("uni_bt_process_fsm: starting SDP query\n");
-                    uni_bt_sdp_query_start(d);
-                    /* 'd' might be invalid */
-                    break;
-                default:
-                    break;
-            }
+                }
+                break;
+            case SDP_QUERY_AFTER_CONNECT:
+                logi("uni_bt_process_fsm: starting SDP query\n");
+                uni_bt_sdp_query_start(d);
+                /* 'd' might be invalid */
+                break;
+            default:
+                break;
         }
     }
 }
@@ -382,7 +393,9 @@ void uni_bt_bredr_on_l2cap_incoming_connection(uint16_t channel, const uint8_t* 
             }
             l2cap_accept_connection(channel);
             uni_hid_device_set_connection_handle(device, handle);
-            device->conn.control_cid = channel;
+            if (device->conn.control_cid == 0) {
+                device->conn.control_cid = channel;
+            }
             uni_hid_device_set_incoming(device, true);
             break;
         case PSM_HID_INTERRUPT:
@@ -391,7 +404,9 @@ void uni_bt_bredr_on_l2cap_incoming_connection(uint16_t channel, const uint8_t* 
                 l2cap_decline_connection(channel);
                 break;
             }
-            device->conn.interrupt_cid = channel;
+            if (device->conn.interrupt_cid == 0) {
+                device->conn.interrupt_cid = channel;
+            }
             l2cap_accept_connection(channel);
             break;
         default:
@@ -423,13 +438,9 @@ void uni_bt_bredr_on_l2cap_channel_opened(uint16_t channel, const uint8_t* packe
     status = l2cap_event_channel_opened_get_status(packet);
     if (status) {
         logi("L2CAP Connection failed: 0x%02x.\n", status);
-        // Practice showed that if the connection fails, just disconnect/remove
-        // so that the connection can start again.
         if (status == L2CAP_CONNECTION_RESPONSE_RESULT_REFUSED_SECURITY) {
             logi("Probably GAP-security-related issues. Set GAP security to 2\n");
         }
-        logi("Removing key for device: %s.\n", bd_addr_to_str(address));
-        gap_drop_link_key_for_bd_addr(device->conn.btaddr);
         uni_hid_device_disconnect(device);
         uni_hid_device_delete(device);
         /* 'device' is destroyed, don't use */
@@ -450,15 +461,14 @@ void uni_bt_bredr_on_l2cap_channel_opened(uint16_t channel, const uint8_t* packe
 
     switch (psm) {
         case PSM_HID_CONTROL:
-            device->conn.control_cid = l2cap_event_channel_opened_get_local_cid(packet);
+            device->conn.control_cid = local_cid;
             logi("HID Control opened, cid 0x%02x\n", device->conn.control_cid);
             uni_bt_conn_set_state(&device->conn, UNI_BT_CONN_STATE_L2CAP_CONTROL_CONNECTED);
             break;
         case PSM_HID_INTERRUPT:
-            device->conn.interrupt_cid = l2cap_event_channel_opened_get_local_cid(packet);
+            device->conn.interrupt_cid = local_cid;
             logi("HID Interrupt opened, cid 0x%02x\n", device->conn.interrupt_cid);
             uni_bt_conn_set_state(&device->conn, UNI_BT_CONN_STATE_L2CAP_INTERRUPT_CONNECTED);
-
             // Set "connected" only after PSM_HID_INTERRUPT.
             uni_hid_device_connect(device);
             break;
@@ -513,22 +523,20 @@ void uni_bt_bredr_on_l2cap_data_packet(uint16_t channel, const uint8_t* packet, 
         return;
     }
 
-    if (channel != d->conn.interrupt_cid) {
-        loge("on_l2cap_data_packet: invalid interrupt CID: got 0x%02x, want: 0x%02x\n", channel, d->conn.interrupt_cid);
-        return;
-    }
-
     // It must be an input report
     // DATA | INPUT_REPORT: 0xa1
-    if (packet[0] != ((HID_MESSAGE_TYPE_DATA << 4) | HID_REPORT_TYPE_INPUT)) {
-        loge("on_l2cap_data_packet: unexpected transaction type: got 0x%02x, want: 0x0a1\n", packet[0]);
-        printf_hexdump(packet, size);
+    if (packet[0] == ((HID_MESSAGE_TYPE_DATA << 4) | HID_REPORT_TYPE_INPUT)) {
+        if (d->conn.interrupt_cid != channel) {
+            d->conn.interrupt_cid = channel;
+        }
+        // Skip the first byte, which is always 0xa1
+        uni_hid_parse_input_report(d, &packet[1], size - 1);
+        uni_hid_device_process_controller(d);
         return;
     }
 
-    // Skip the first byte, which is always 0xa1
-    uni_hid_parse_input_report(d, &packet[1], size - 1);
-    uni_hid_device_process_controller(d);
+    loge("on_l2cap_data_packet: unexpected transaction type: got 0x%02x, want: 0x0a1\n", packet[0]);
+    printf_hexdump(packet, size);
 }
 
 void uni_bt_bredr_on_gap_inquiry_result(uint16_t channel, const uint8_t* packet, uint16_t size) {
@@ -653,13 +661,38 @@ void uni_bt_bredr_on_hci_connection_complete(uint16_t channel, const uint8_t* pa
     if (is_keyboard) {
         // gap_request_security_level(handle, LEVEL_1);
     }
-#ifndef CONFIG_BLUEPAD32_GAP_SECURITY
-    // Seems to help on certain devices when using GAP Security level 0.
-    // For exmaple, Dualshock 3 and Nintendo Switch works when the l2cap security level is 0,
-    // and then I request it here to be 2.
-    // But this is not perfect solution, since other gamepads requires that L2CAP be at Level 2.
+    // Always request GAP Security Level 2 to ensure authentication, encryption and bonding/link key storage occur
     gap_request_security_level(handle, LEVEL_2);
-#endif
+}
+
+void uni_bt_bredr_on_hci_authentication_complete(hci_con_handle_t handle) {
+    uni_hid_device_t* d = uni_hid_device_get_instance_for_connection_handle(handle);
+    if (!d) {
+        logi("uni_bt_bredr_on_hci_authentication_complete: device not found for handle 0x%04x\n", handle);
+        return;
+    }
+    logi("uni_bt_bredr_on_hci_authentication_complete: device %s, incoming=%d, control_cid=0x%04x, state=%d\n",
+         bd_addr_to_str(d->conn.btaddr), uni_hid_device_is_incoming(d), d->conn.control_cid,
+         uni_bt_conn_get_state(&d->conn));
+
+    if (uni_hid_device_is_incoming(d)) {
+        if (!uni_hid_device_has_name(d)) {
+            logi("uni_bt_bredr_on_hci_authentication_complete: requesting remote name for %s\n",
+                 bd_addr_to_str(d->conn.btaddr));
+            if (d->conn.clock_offset & UNI_BT_CLOCK_OFFSET_VALID)
+                gap_remote_name_request(d->conn.btaddr, d->conn.page_scan_repetition_mode, d->conn.clock_offset);
+            else
+                gap_remote_name_request(d->conn.btaddr, 0x02, 0x0000);
+
+            uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_INQUIRED);
+        } else {
+            uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
+            uni_bt_bredr_process_fsm(d);
+        }
+    } else if (d->conn.control_cid == 0) {
+        logi("uni_bt_bredr_on_hci_authentication_complete: starting L2CAP control connection\n");
+        l2cap_create_control_connection(d);
+    }
 }
 
 void uni_bt_bredr_on_hci_disconnection_complete(uint16_t channel, const uint8_t* packet, uint16_t size) {

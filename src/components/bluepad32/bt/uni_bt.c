@@ -365,6 +365,9 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                     status = hci_event_authentication_complete_get_status(packet);
                     handle = hci_event_authentication_complete_get_connection_handle(packet);
                     logi("--> HCI_EVENT_AUTHENTICATION_COMPLETE_EVENT: status=%d, handle=0x%04x\n", status, handle);
+                    if (status == 0 && IS_ENABLED(UNI_ENABLE_BREDR)) {
+                        uni_bt_bredr_on_hci_authentication_complete(handle);
+                    }
                     break;
                 }
                 case HCI_EVENT_PIN_CODE_REQUEST: {

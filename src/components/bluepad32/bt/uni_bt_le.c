@@ -65,6 +65,7 @@
 
 #include "sdkconfig.h"
 
+#include "bt/uni_bt_bredr.h"
 #include "bt/uni_bt_conn.h"
 #include "bt/uni_bt_defines.h"
 #include "parser/uni_hid_parser.h"
@@ -89,6 +90,8 @@ static void hog_connect(bd_addr_t addr, bd_addr_type_t addr_type) {
     // Happens in ESP32, but not in libusb
     gap_stop_scan();
     logi("BLE scan -> 0\n");
+
+    uni_bt_bredr_scan_stop();
 
     gap_connect(addr, addr_type);
 }
@@ -207,6 +210,83 @@ static void adv_event_get_data(const uint8_t* packet, uint16_t* appearance, char
     get_advertisement_data(ad_data, ad_len, appearance, name);
 }
 
+static const uint8_t s_default_boot_mouse_hid_descriptor[] = {
+    0x05, 0x01,        // Usage Page (Generic Desktop)
+    0x09, 0x02,        // Usage (Mouse)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x02,        //   Report ID (2) - matches HID_BOOT_MODE_MOUSE_ID
+    0x09, 0x01,        //   Usage (Pointer)
+    0xA1, 0x00,        //   Collection (Physical)
+    0x05, 0x09,        //     Usage Page (Buttons)
+    0x19, 0x01,        //     Usage Minimum (1)
+    0x29, 0x03,        //     Usage Maximum (3)
+    0x15, 0x00,        //     Logical Minimum (0)
+    0x25, 0x01,        //     Logical Maximum (1)
+    0x95, 0x03,        //     Report Count (3)
+    0x75, 0x01,        //     Report Size (1)
+    0x81, 0x02,        //     Input (Data, Variable, Absolute)
+    0x95, 0x01,        //     Report Count (1)
+    0x75, 0x05,        //     Report Size (5)
+    0x81, 0x01,        //     Input (Constant)
+    0x05, 0x01,        //     Usage Page (Generic Desktop)
+    0x09, 0x30,        //     Usage (X)
+    0x09, 0x31,        //     Usage (Y)
+    0x15, 0x81,        //     Logical Minimum (-127)
+    0x25, 0x7F,        //     Logical Maximum (127)
+    0x75, 0x08,        //     Report Size (8)
+    0x95, 0x02,        //     Report Count (2)
+    0x81, 0x06,        //     Input (Data, Variable, Relative)
+    0x09, 0x38,        //     Usage (Wheel)
+    0x15, 0x81,        //     Logical Minimum (-127)
+    0x25, 0x7F,        //     Logical Maximum (127)
+    0x75, 0x08,        //     Report Size (8)
+    0x95, 0x01,        //     Report Count (1)
+    0x81, 0x06,        //     Input (Data, Variable, Relative)
+    0xC0,              //   End Collection
+    0xC0               // End Collection
+};
+
+static const uint8_t s_default_boot_keyboard_hid_descriptor[] = {
+    0x05, 0x01,        // Usage Page (Generic Desktop)
+    0x09, 0x06,        // Usage (Keyboard)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x01,        //   Report ID (1) - matches HID_BOOT_MODE_KEYBOARD_ID
+    0x05, 0x07,        //   Usage Page (Key Codes)
+    0x19, 0xE0,        //   Usage Minimum (224 / Left Control)
+    0x29, 0xE7,        //   Usage Maximum (231 / Right GUI)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x01,        //   Logical Maximum (1)
+    0x75, 0x01,        //   Report Size (1)
+    0x95, 0x08,        //   Report Count (8)
+    0x81, 0x02,        //   Input (Data, Variable, Absolute)
+    0x95, 0x01,        //   Report Count (1)
+    0x75, 0x08,        //   Report Size (8)
+    0x81, 0x01,        //   Input (Constant)
+    0x95, 0x06,        //   Report Count (6)
+    0x75, 0x08,        //   Report Size (8)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x65,        //   Logical Maximum (101)
+    0x05, 0x07,        //   Usage Page (Key Codes)
+    0x19, 0x00,        //   Usage Minimum (0)
+    0x29, 0x65,        //   Usage Maximum (101)
+    0x81, 0x00,        //   Input (Data, Array)
+    0xC0               // End Collection
+};
+
+static bool is_le_mouse(const uni_hid_device_t* d) {
+    if (!d) return false;
+    if (uni_hid_device_is_mouse(d)) return true;
+    if (d->name[0] != 0 && (strstr(d->name, "Mouse") != NULL || strstr(d->name, "mouse") != NULL)) return true;
+    return false;
+}
+
+static bool is_le_keyboard(const uni_hid_device_t* d) {
+    if (!d) return false;
+    if (uni_hid_device_is_keyboard(d)) return true;
+    if (d->name[0] != 0 && (strstr(d->name, "Keyboard") != NULL || strstr(d->name, "keyboard") != NULL)) return true;
+    return false;
+}
+
 static void parse_report(const uint8_t* packet, uint16_t size) {
     uint16_t service_index;
     uint16_t hids_cid;
@@ -227,20 +307,43 @@ static void parse_report(const uint8_t* packet, uint16_t size) {
         return;
     }
 
-    // FIXME: Copying the HID descriptor should be done at setup time since some device, like Xbox requires it
-    // to set the correct parser.
-    // But not clear how to get the "service_index" from setup
+    logi("[UNI_BT_LE] parse_report: hids_cid=%d, service_index=%d, desc_len=%d\n", hids_cid, service_index, device->hid_descriptor_len);
+
+    // Copy HID descriptor or use default boot descriptor if unavailable
     if (device->hid_descriptor_len == 0) {
         descriptor_data = hids_client_descriptor_storage_get_descriptor_data(hids_cid, service_index);
         descriptor_len = hids_client_descriptor_storage_get_descriptor_len(hids_cid, service_index);
 
-        uni_hid_device_set_hid_descriptor(device, descriptor_data, descriptor_len);
+        if (descriptor_len == 0 || descriptor_data == NULL) {
+            if (is_le_mouse(device)) {
+                logi("[UNI_BT_LE] Using default Boot Mouse HID descriptor\n");
+                descriptor_data = s_default_boot_mouse_hid_descriptor;
+                descriptor_len = sizeof(s_default_boot_mouse_hid_descriptor);
+            } else if (is_le_keyboard(device)) {
+                logi("[UNI_BT_LE] Using default Boot Keyboard HID descriptor\n");
+                descriptor_data = s_default_boot_keyboard_hid_descriptor;
+                descriptor_len = sizeof(s_default_boot_keyboard_hid_descriptor);
+            }
+        }
+
+        if (descriptor_data && descriptor_len > 0) {
+            uni_hid_device_set_hid_descriptor(device, descriptor_data, descriptor_len);
+        }
     }
     report_data = gattservice_subevent_hid_report_get_report(packet);
     report_len = gattservice_subevent_hid_report_get_report_len(packet);
 
     uni_hid_parse_input_report(device, report_data, report_len);
     uni_hid_device_process_controller(device);
+}
+
+static btstack_timer_source_t hids_connect_timer;
+static btstack_timer_source_t hids_watchdog_timer;
+
+static void hids_watchdog_timer_handler(btstack_timer_source_t* ts) {
+    hci_con_handle_t con_handle = (hci_con_handle_t)(uintptr_t)btstack_run_loop_get_timer_context(ts);
+    loge("[UNI_BT_LE] HIDS connection timeout for con_handle 0x%04x -> disconnecting\n", con_handle);
+    hog_disconnect(con_handle);
 }
 
 static void uni_hids_client_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
@@ -268,8 +371,11 @@ static void uni_hids_client_packet_handler(uint8_t packet_type, uint16_t channel
         return;
     }
 
+    logi("[UNI_HIDS] packet_handler subevent=0x%02x\n", hci_event_gattservice_meta_get_subevent_code(packet));
+
     switch (hci_event_gattservice_meta_get_subevent_code(packet)) {
         case GATTSERVICE_SUBEVENT_HID_SERVICE_CONNECTED:
+            btstack_run_loop_remove_timer(&hids_watchdog_timer);
             status = gattservice_subevent_hid_service_connected_get_status(packet);
             logi("GATTSERVICE_SUBEVENT_HID_SERVICE_CONNECTED, status=0x%02x\n", status);
             switch (status) {
@@ -345,6 +451,42 @@ static void uni_hids_client_packet_handler(uint8_t packet_type, uint16_t channel
     }
 }
 
+static void hids_connect_timer_handler(btstack_timer_source_t* ts) {
+    hci_con_handle_t con_handle = (hci_con_handle_t)(uintptr_t)btstack_run_loop_get_timer_context(ts);
+    uint16_t hids_cid;
+    uni_hid_device_t* device = uni_hid_device_get_instance_for_connection_handle(con_handle);
+    if (!device) {
+        loge("Invalid device for deferred HIDS connect\n");
+        return;
+    }
+
+    hid_protocol_mode_t mode = HID_PROTOCOL_MODE_REPORT;
+    if (is_le_mouse(device) || is_le_keyboard(device)) {
+        logi("[UNI_BT_LE] Device is mouse/keyboard -> using HID_PROTOCOL_MODE_BOOT\n");
+        mode = HID_PROTOCOL_MODE_BOOT;
+    }
+
+    logi("Search for HID service, con_handle: %#x, mode: %d\n", con_handle, mode);
+    uint8_t status = hids_client_connect(con_handle, uni_hids_client_packet_handler, mode, &hids_cid);
+    if (status == ERROR_CODE_COMMAND_DISALLOWED) {
+        logi("HID client connection failed with COMMAND_DISALLOWED, ignoring \n");
+    }
+    if (status != ERROR_CODE_SUCCESS) {
+        logi("HID client connection failed, status=%#x\n", status);
+        hog_disconnect(con_handle);
+        return;
+    }
+    logi("Using hids_cid=%d\n", hids_cid);
+    device->hids_cid = hids_cid;
+
+    // Start 5-second watchdog timer in case remote BLE HID device stalls
+    btstack_run_loop_remove_timer(&hids_watchdog_timer);
+    btstack_run_loop_set_timer_context(&hids_watchdog_timer, (void*)(uintptr_t)con_handle);
+    btstack_run_loop_set_timer_handler(&hids_watchdog_timer, &hids_watchdog_timer_handler);
+    btstack_run_loop_set_timer(&hids_watchdog_timer, 5000);
+    btstack_run_loop_add_timer(&hids_watchdog_timer);
+}
+
 static void uni_device_information_packet_handler(uint8_t packet_type,
                                                   uint16_t channel,
                                                   uint8_t* packet,
@@ -355,7 +497,6 @@ static void uni_device_information_packet_handler(uint8_t packet_type,
     hci_con_handle_t con_handle;
     uni_hid_device_t* device;
     uint8_t event_type;
-    uint16_t hids_cid;
 
     UNUSED(channel);
     UNUSED(size);
@@ -389,27 +530,16 @@ static void uni_device_information_packet_handler(uint8_t packet_type,
                     logi("Device Information service found\n");
                     device = uni_hid_device_get_instance_for_connection_handle(con_handle);
                     if (!device) {
-                        loge("Invalid device for in GATTSERVICE_SUBEVENT_DEVICE_INFORMATION_DONE");
+                        loge("Invalid device for in GATTSERVICE_SUBEVENT_DEVICE_INFORMATION_DONE\n");
                         break;
                     }
 
-                    // Continue - query primary services.
-                    logi("Search for HID service, con_handle: %#x\n", con_handle);
-                    status = hids_client_connect(con_handle, uni_hids_client_packet_handler, HID_PROTOCOL_MODE_REPORT,
-                                                 &hids_cid);
-                    if (status == ERROR_CODE_COMMAND_DISALLOWED) {
-                        logi("HID client connection failed with COMMAND_DISALLOWED, ignoring \n");
-                        // Means that a HIDS client connection is already present.
-                        // We forgot to delete it.
-                        // hids_client_disconnect(con_handle);
-                    }
-                    if (status != ERROR_CODE_SUCCESS) {
-                        logi("HID client connection failed, status=%#x\n", status);
-                        hog_disconnect(con_handle);
-                        break;
-                    }
-                    logi("Using hids_cid=%d\n", hids_cid);
-                    device->hids_cid = hids_cid;
+                    // Defer HIDS connect slightly (50ms) so GATT client state machine completes DIS and is ready
+                    btstack_run_loop_remove_timer(&hids_connect_timer);
+                    btstack_run_loop_set_timer_context(&hids_connect_timer, (void*)(uintptr_t)con_handle);
+                    btstack_run_loop_set_timer_handler(&hids_connect_timer, &hids_connect_timer_handler);
+                    btstack_run_loop_set_timer(&hids_connect_timer, 50);
+                    btstack_run_loop_add_timer(&hids_connect_timer);
                     break;
                 default:
                     logi("Device Information service client connection failed, error=%#x.\n", status);
@@ -825,6 +955,9 @@ void uni_bt_le_on_hci_disconnection_complete(uint16_t channel, const uint8_t* pa
     ARG_UNUSED(channel);
     ARG_UNUSED(packet);
     ARG_UNUSED(size);
+
+    btstack_run_loop_remove_timer(&hids_connect_timer);
+    btstack_run_loop_remove_timer(&hids_watchdog_timer);
 
     resume_scanning_hint();
 }
