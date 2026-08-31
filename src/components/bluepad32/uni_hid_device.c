@@ -598,7 +598,9 @@ void uni_hid_device_guess_controller_type_from_pid_vid(uni_hid_device_t* d) {
     if (type == CONTROLLER_TYPE_Unknown || type == CONTROLLER_TYPE_UnknownNonSteamController ||
         type == CONTROLLER_TYPE_UnknownSteamController) {
         logi("Device (vendor_id=0x%04x, product_id=0x%04x) not found in DB.\n", d->vendor_id, d->product_id);
-        if (uni_hid_device_is_mouse(d)) {
+        if (d->vendor_id == 0x1235 && d->product_id == 0xaa22) {
+            type = CONTROLLER_TYPE_GenericMouse;
+        } else if (uni_hid_device_is_mouse(d)) {
             type = CONTROLLER_TYPE_GenericMouse;
         } else if (uni_hid_device_is_keyboard(d)) {
             type = CONTROLLER_TYPE_GenericKeyboard;

@@ -799,12 +799,22 @@ void uni_bt_bredr_on_hci_authentication_complete(hci_con_handle_t handle) {
                 gap_remote_name_request(d->conn.btaddr, 0x02, 0x0000);
 
             uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_INQUIRED);
-        } else if (sec >= LEVEL_2) {
+        } else if (sec >= LEVEL_2 && d->conn.control_cid == 0) {
+            // BUG FIX: Only kick the FSM here when L2CAP hasn't started yet.
+            // A second HCI_AUTHENTICATION_COMPLETE arrives for incoming Switch Pro controllers
+            // after L2CAP Control is already open (link key upgrade for the interrupt channel
+            // authentication). Without the control_cid == 0 guard, this resets state to
+            // REMOTE_NAME_FETCHED and calls process_fsm while both CIDs happen to be set
+            // (interrupt was being created), causing uni_hid_device_set_ready() to fire before
+            // the interrupt channel is fully open, then again when it opens -> double
+            // on_device_ready -> platform hung waiting for a response that never comes.
             uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
             uni_bt_bredr_process_fsm(d);
-        } else {
+        } else if (sec < LEVEL_2 && d->conn.control_cid == 0) {
             logi("uni_bt_bredr_on_hci_authentication_complete: waiting for encryption change before L2CAP\n");
         }
+        // else: auth completed again after L2CAP already started (e.g. link key upgrade for
+        // interrupt channel); the FSM will be driven by L2CAP channel events, not auth events.
     } else if (d->conn.control_cid == 0) {
         logi("uni_bt_bredr_on_hci_authentication_complete: starting L2CAP control connection\n");
         l2cap_create_control_connection(d);

@@ -136,11 +136,6 @@ void uni_hid_parser_mouse_parse_input_report(struct uni_hid_device_s* d, const u
         return;
     }
 
-    // If a full HID descriptor is present, parse_usage handles the report
-    if (d->hid_descriptor_len > 0) {
-        return;
-    }
-
     uni_controller_t* ctl = &d->controller;
     ctl->klass = UNI_CONTROLLER_CLASS_MOUSE;
 
@@ -149,38 +144,24 @@ void uni_hid_parser_mouse_parse_input_report(struct uni_hid_device_s* d, const u
     int16_t dy = 0;
     int8_t wheel = 0;
 
-    if (d->conn.protocol == UNI_BT_CONN_PROTOCOL_BLE) {
-        // BLE HIDS prepends the Report ID at report[0]:
-        // len >= 6 (e.g. len == 8): [report_id, buttons, dx_low, dx_high, dy_low, dy_high, (wheel), (pan)]
-        // len == 4 / 5:             [report_id, buttons, dx_8, dy_8, (wheel)]
-        if (len >= 6) {
-            buttons = report[1];
-            dx = (int16_t)((uint16_t)report[2] | ((uint16_t)report[3] << 8));
-            dy = (int16_t)((uint16_t)report[4] | ((uint16_t)report[5] << 8));
-            wheel = (len >= 7) ? (int8_t)report[6] : 0;
-        } else if (len >= 4) {
-            buttons = report[1];
-            dx = (int8_t)report[2];
-            dy = (int8_t)report[3];
-            wheel = (len >= 5) ? (int8_t)report[4] : 0;
-        } else {
-            buttons = report[0];
-            dx = (int8_t)report[1];
-            dy = (int8_t)report[2];
-        }
+    if (len >= 4 && d->conn.protocol == UNI_BT_CONN_PROTOCOL_BLE && (report[0] == 0x02 || report[0] == 0x01)) {
+        // BLE HIDS report with prepended Report ID: [0x02, buttons, dx, dy, (wheel)]
+        buttons = report[1];
+        dx = (int8_t)report[2];
+        dy = (int8_t)report[3];
+        wheel = (len >= 5) ? (int8_t)report[4] : 0;
+    } else if (len >= 6 && d->conn.protocol != UNI_BT_CONN_PROTOCOL_BLE) {
+        // Classic BT 16-bit report: [buttons, dx_low, dx_high, dy_low, dy_high, (wheel)]
+        buttons = report[0];
+        dx = (int16_t)((uint16_t)report[1] | ((uint16_t)report[2] << 8));
+        dy = (int16_t)((uint16_t)report[3] | ((uint16_t)report[4] << 8));
+        wheel = (len >= 6) ? (int8_t)report[5] : 0;
     } else {
-        // Classic BT / Raw:
-        if (len >= 5) {
-            buttons = report[0];
-            dx = (int16_t)((uint16_t)report[1] | ((uint16_t)report[2] << 8));
-            dy = (int16_t)((uint16_t)report[3] | ((uint16_t)report[4] << 8));
-            wheel = (len >= 6) ? (int8_t)report[5] : 0;
-        } else {
-            buttons = report[0];
-            dx = (int8_t)report[1];
-            dy = (int8_t)report[2];
-            wheel = (len >= 4) ? (int8_t)report[3] : 0;
-        }
+        // Standard Boot Mouse / raw 8-bit report: [buttons, dx, dy, (wheel)]
+        buttons = report[0];
+        dx = (int8_t)report[1];
+        dy = (int8_t)report[2];
+        wheel = (len >= 4) ? (int8_t)report[3] : 0;
     }
 
     if (buttons & 0x01) ctl->mouse.buttons |= UNI_MOUSE_BUTTON_LEFT;

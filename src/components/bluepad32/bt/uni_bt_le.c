@@ -254,7 +254,6 @@ static const uint8_t s_default_boot_mouse_hid_descriptor[] = {
     0x05, 0x01,  // Usage Page (Generic Desktop)
     0x09, 0x02,  // Usage (Mouse)
     0xA1, 0x01,  // Collection (Application)
-    0x85, 0x02,  //   Report ID (2) - matches HID_BOOT_MODE_MOUSE_ID
     0x09, 0x01,  //   Usage (Pointer)
     0xA1, 0x00,  //   Collection (Physical)
     0x05, 0x09,  //     Usage Page (Buttons)
@@ -290,7 +289,6 @@ static const uint8_t s_default_boot_keyboard_hid_descriptor[] = {
     0x05, 0x01,  // Usage Page (Generic Desktop)
     0x09, 0x06,  // Usage (Keyboard)
     0xA1, 0x01,  // Collection (Application)
-    0x85, 0x01,  //   Report ID (1) - matches HID_BOOT_MODE_KEYBOARD_ID
     0x05, 0x07,  //   Usage Page (Key Codes)
     0x19, 0xE0,  //   Usage Minimum (224 / Left Control)
     0x29, 0xE7,  //   Usage Maximum (231 / Right GUI)
@@ -318,8 +316,18 @@ static bool is_le_mouse(const uni_hid_device_t* d) {
         return false;
     if (uni_hid_device_is_mouse(d))
         return true;
-    if (d->name[0] != 0 && (strstr(d->name, "Mouse") != NULL || strstr(d->name, "mouse") != NULL))
+    if (d->vendor_id == 0x1235 && d->product_id == 0xaa22)
         return true;
+    if (d->name[0] != 0 && (strstr(d->name, "Mouse") != NULL || strstr(d->name, "mouse") != NULL || strstr(d->name, "Canosa") != NULL))
+        return true;
+
+    gamepad_info_t info;
+    if (flash_storage_get_device_info(d->conn.btaddr, &info)) {
+        if (info.default_mode == 1 || strstr(info.name, "Mouse") != NULL || strstr(info.name, "mouse") != NULL ||
+            strstr(info.friendly_name, "Mouse") != NULL || strstr(info.name, "Canosa") != NULL) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -454,7 +462,15 @@ static void uni_hids_client_packet_handler(uint8_t packet_type, uint16_t channel
                     resume_scanning_hint();
                     break;
                 default:
-                    loge("HID service client connection failed, err 0x%02x.\n", status);
+                    loge("HID service client connection failed, err 0x%02x. Removing from auto-connection.\n", status);
+                    btstack_run_loop_remove_timer(&hids_watchdog_timer);
+                    hids_cid = gattservice_subevent_hid_service_connected_get_hids_cid(packet);
+                    device = uni_hid_device_get_instance_for_hids_cid(hids_cid);
+                    if (device) {
+                        gap_auto_connection_stop(BD_ADDR_TYPE_LE_PUBLIC, device->conn.btaddr);
+                        gap_auto_connection_stop(BD_ADDR_TYPE_LE_RANDOM, device->conn.btaddr);
+                        hog_disconnect(device->conn.handle);
+                    }
                     break;
             }
             break;
@@ -589,34 +605,35 @@ static void uni_device_information_packet_handler(uint8_t packet_type,
                         gamepad_info_t info;
                         if (flash_storage_get_device_info(device->conn.btaddr, &info) && strlen(info.name) > 0) {
                             uni_hid_device_set_name(device, info.name);
-                            uni_hid_device_guess_controller_type_from_name(device, device->name);
                         }
                     }
+                    uni_hid_device_guess_controller_type_from_pid_vid(device);
 
-                    // Some BLE keyboards and mice fail during REPORT mode setup but work in BOOT mode.
-                    requested_protocol_mode = (uni_hid_device_is_keyboard(device) || uni_hid_device_is_mouse(device))
-                                                  ? HID_PROTOCOL_MODE_BOOT
-                                                  : HID_PROTOCOL_MODE_REPORT;
-
-                    // Continue - query primary services.
-                    logi("Search for HID service, con_handle: %#x, protocol_mode=%d\n", con_handle,
-                         requested_protocol_mode);
-                    status = hids_client_connect(con_handle, uni_hids_client_packet_handler, requested_protocol_mode,
-                                                 &hids_cid);
-                    if (status == ERROR_CODE_COMMAND_DISALLOWED) {
-                        logi("HID client connection failed with COMMAND_DISALLOWED, ignoring \n");
-                        // Means that a HIDS client connection is already present.
-                        // We forgot to delete it.
-                        // hids_client_disconnect(con_handle);
-                    }
-                    if (status != ERROR_CODE_SUCCESS) {
-                        logi("HID client connection failed, status=%#x\n", status);
-                        hog_disconnect(con_handle);
-                        break;
-                    }
-                    logi("Using hids_cid=%d\n", hids_cid);
-                    device->hids_cid = hids_cid;
+                    // BUG FIX (ROOT CAUSE OF MOUSE HANG): Calling hids_client_connect()
+                    // directly from within the GATTSERVICE_SUBEVENT_DEVICE_INFORMATION_DONE
+                    // callback is a REENTRANT GATT CLIENT CALL. The GATT client has not
+                    // returned to idle state when this callback fires -- it is still inside
+                    // gatt_client_run() processing the DIS result. Calling another GATT
+                    // operation (hids_client_connect -> gatt_client_discover_primary_services)
+                    // from within the callback causes the HID primary-service discovery to
+                    // silently stall: the GATT client is busy and never sends the ATT request,
+                    // the mouse never gets a request, never responds, and
+                    // GATTSERVICE_SUBEVENT_HID_SERVICE_CONNECTED never fires -> Pico hangs.
+                    //
+                    // The pre-existing hids_connect_timer was designed exactly for this
+                    // deferred-call pattern (the timer handler already calls hids_client_connect
+                    // AND starts the 5-second watchdog) but was never actually armed.
+                    // Arm it here with a small delay so the DIS callback fully unwinds and
+                    // the GATT client is truly idle before HID discovery begins.
+                    logi("Deferring HIDS connect for con_handle: %#x (GATT client re-entry guard)\n",
+                         con_handle);
+                    btstack_run_loop_remove_timer(&hids_connect_timer);
+                    btstack_run_loop_set_timer_context(&hids_connect_timer, (void*)(uintptr_t)con_handle);
+                    btstack_run_loop_set_timer_handler(&hids_connect_timer, &hids_connect_timer_handler);
+                    btstack_run_loop_set_timer(&hids_connect_timer, 50);
+                    btstack_run_loop_add_timer(&hids_connect_timer);
                 } break;
+
                 default:
                     logi("Device Information service client connection failed, error=%#x.\n", status);
                     hog_disconnect(con_handle);
@@ -915,8 +932,31 @@ void uni_bt_le_on_hci_event_le_meta(const uint8_t* packet, uint16_t size) {
             hci_subevent_le_connection_complete_get_peer_address(packet, event_addr);
             device = uni_hid_device_get_instance_for_address(event_addr);
             if (!device) {
-                loge("uni_bt_le_on_connection_complete: Device not found for addr: %s\n", bd_addr_to_str(event_addr));
-                break;
+                logi("[UNI_BT_LE] Whitelist auto-connect incoming: creating device instance for %s\n",
+                     bd_addr_to_str(event_addr));
+                device = uni_hid_device_create(event_addr);
+                if (!device) {
+                    loge("uni_bt_le_on_connection_complete: Device creation failed for addr: %s\n",
+                         bd_addr_to_str(event_addr));
+                    break;
+                }
+                uni_bt_conn_set_protocol(&device->conn, UNI_BT_CONN_PROTOCOL_BLE);
+                uni_bt_conn_set_state(&device->conn, UNI_BT_CONN_STATE_DEVICE_DISCOVERED);
+
+                gamepad_info_t stored_info;
+                if (flash_storage_get_device_info(event_addr, &stored_info)) {
+                    if (strlen(stored_info.name) > 0) {
+                        uni_hid_device_set_name(device, stored_info.name);
+                    }
+                    if (stored_info.port == -1) {
+                        device->controller_type = CONTROLLER_TYPE_GenericKeyboard;
+                        device->controller.klass = UNI_CONTROLLER_CLASS_KEYBOARD;
+                    } else if (stored_info.default_mode == 1 || strstr(stored_info.name, "Mouse") != NULL ||
+                               strstr(stored_info.friendly_name, "Mouse") != NULL || strstr(stored_info.name, "Canosa") != NULL) {
+                        device->controller_type = CONTROLLER_TYPE_GenericMouse;
+                        device->controller.klass = UNI_CONTROLLER_CLASS_MOUSE;
+                    }
+                }
             }
             con_handle = hci_subevent_le_connection_complete_get_connection_handle(packet);
             logi("Using con_handle: %#x\n", con_handle);
@@ -935,9 +975,6 @@ void uni_bt_le_on_hci_event_le_meta(const uint8_t* packet, uint16_t size) {
             } else {
                 sm_request_pairing(con_handle);
             }
-
-            // Resume scanning
-            // gap_start_scan();
             break;
 
         case HCI_SUBEVENT_LE_ADVERTISING_REPORT:
@@ -1008,7 +1045,10 @@ void uni_bt_le_on_gap_event_advertising_report(const uint8_t* packet, uint16_t s
             appearance = UNI_BT_HID_APPEARANCE_KEYBOARD;
         } else if (stored_info.default_mode == 1 || strstr(stored_info.name, "Mouse") != NULL ||
                    strstr(stored_info.friendly_name, "Mouse") != NULL || strstr(name, "Mouse") != NULL ||
-                   strstr(name, "Canosa") != NULL || stored_info.port == 0) {
+                   strstr(name, "Canosa") != NULL) {
+            // BUG FIX: removed || stored_info.port == 0 — Port 1 (port==0) is also used by
+            // gamepads, so this condition was misidentifying any Port 1 gamepad as a mouse
+            // on reconnect. Mouse identity is correctly captured by default_mode==1 or name.
             appearance = UNI_BT_HID_APPEARANCE_MOUSE;
         } else if (appearance == 0) {
             appearance = (stored_info.default_mode == 0 || stored_info.default_mode == 2 || stored_info.port == 1)
@@ -1088,7 +1128,12 @@ void uni_bt_le_on_hci_disconnection_complete(uint16_t channel, const uint8_t* pa
     btstack_run_loop_remove_timer(&hids_connect_timer);
     btstack_run_loop_remove_timer(&hids_watchdog_timer);
 
-    resume_scanning_hint();
+    if (is_scanning) {
+        resume_scanning_hint();
+    } else {
+        // Re-arm hardware whitelist auto-connection so disconnected BLE devices can reconnect instantly with 0 IRQ
+        gap_connect_with_whitelist();
+    }
 }
 
 void uni_bt_le_list_bonded_keys(void) {
@@ -1148,45 +1193,38 @@ void uni_bt_le_setup(void) {
     // Prefer Just Works so BLE keyboards don't require manual passkey entry.
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
 
-    // TL;DR:
-    // Enable Secure connection, disable bonding
-
-    // Legacy paring, Just Works in ESP32
-    // - Stadia: Ok
-    // - MS mouse: Ok
-    // - Xbox 3 buttons: flaky, fails to connect or connects
-    // - Xbox 2 buttons: flaky, fails to connect or connects
-    // sm_set_authentication_requirements(0);
-
-    // Compatibility mode: some BLE keyboards reject SMP pairing entirely.
-    // Allow unbonded operation and let protected characteristics request auth if needed.
-    sm_set_authentication_requirements(SM_AUTHREQ_NO_BONDING);
-
-    // Secure connection + NO bonding in ESP32:
-    // - Stadia: Ok
-    // - MS mouse: Ok
-    // - Xbox 3 buttons: Ok
-    // - Xbox 2 buttons: fails to connect
-    // sm_set_secure_connections_only_mode(true);
-    // gap_set_secure_connections_only_mode(true);
-    // sm_set_authentication_requirements(SM_AUTHREQ_SECURE_CONNECTION);
-
-    // Secure connection + bonding in ESP32:
-    // - Stadia: Ok
-    // - MS mouse: Ok... but disconnects after 10 seconds
-    // - Xbox 3 buttons: fails to connect
-    // - Xbox 2 buttons: fails to connect
-    // sm_set_authentication_requirements(SM_AUTHREQ_SECURE_CONNECTION | SM_AUTHREQ_BONDING);
-
-    // libusb works with mostly any configuration
+    // SM Bonding
+    sm_set_authentication_requirements(SM_AUTHREQ_BONDING);
 
     gatt_client_init();
     hids_client_init(hid_descriptor_storage, sizeof(hid_descriptor_storage));
-    // FIXME: this is an empty function and PicoW toolchain is removing empty function (?)
-    // scan_parameters_service_client_init();
     device_information_service_client_init();
 
+    // Default passive scan parameters for pairing
     gap_set_scan_parameters(0 /* type: passive */, 48 /* interval */, 48 /* window */);
+
+    // Robust connection parameters: 15ms-30ms interval, 4 slave latency, 4000ms supervision timeout
+    gap_set_connection_parameters(0x0030, 0x0030, 12, 24, 4, 400, 0x0010, 0x0030);
+}
+
+void uni_bt_le_add_auto_connection(bd_addr_type_t address_type, const bd_addr_t address) {
+    if (!ble_enabled)
+        return;
+    gap_auto_connection_start(address_type, address);
+    logi("[UNI_BT_LE] Hardware whitelist auto-connection armed for: %s (type %d)\n",
+         bd_addr_to_str(address), (int)address_type);
+}
+
+void uni_bt_le_remove_auto_connection(bd_addr_type_t address_type, const bd_addr_t address) {
+    if (!ble_enabled)
+        return;
+    gap_auto_connection_stop(address_type, address);
+}
+
+void uni_bt_le_arm_auto_connection(void) {
+    if (!ble_enabled)
+        return;
+    gap_connect_with_whitelist();
 }
 
 void uni_bt_le_scan_start(void) {
