@@ -25,6 +25,7 @@ void uni_bt_le_on_hci_disconnection_complete(uint16_t channel, const uint8_t* pa
 
 void uni_bt_le_scan_start(void);
 void uni_bt_le_scan_stop(void);
+void uni_bt_le_resume_scanning_hint(void);
 
 // Called from uni_hid_device_disconnect()
 void uni_bt_le_disconnect(uni_hid_device_t* d);

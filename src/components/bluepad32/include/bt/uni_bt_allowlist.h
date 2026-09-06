@@ -51,6 +51,9 @@ bool uni_bt_allowlist_is_enabled(void);
 // Enables/Disables the allowlist feature.
 void uni_bt_allowlist_set_enabled(bool enabled);
 
+// Temporarily enable/disable allowlist enforcement in RAM without writing to Flash TLV.
+void uni_bt_allowlist_set_enforced_temporary(bool enabled);
+
 // Initialize the Allowlist feature.
 void uni_bt_allowlist_init(void);
 

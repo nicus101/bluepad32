@@ -528,6 +528,25 @@ void uni_bt_bredr_on_l2cap_channel_opened(uint16_t channel, const uint8_t* packe
     status = l2cap_event_channel_opened_get_status(packet);
     if (status) {
         logi("L2CAP Connection failed: 0x%02x.\n", status);
+        if (status == ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS) {
+            logi("ACL connection already exists for %s, keeping device instance and waiting for link\n",
+                 bd_addr_to_str(address));
+            device->conn.control_cid = 0;
+            hci_connection_t* conn = hci_connection_for_bd_addr_and_type(address, BD_ADDR_TYPE_ACL);
+            if (conn != NULL && conn->state == OPEN) {
+                logi("Adopting existing open ACL link (handle=0x%04x) for %s\n", conn->con_handle,
+                     bd_addr_to_str(address));
+                uni_hid_device_set_connection_handle(device, conn->con_handle);
+                l2cap_create_control_connection(device);
+            }
+            return;
+        }
+        if (status == L2CAP_CONNECTION_RESPONSE_RESULT_REFUSED_SECURITY ||
+            status == L2CAP_CONNECTION_BASEBAND_DISCONNECT ||
+            status == 0x05) {
+            logi("Dropping link key for %s on failure 0x%02x\n", bd_addr_to_str(address), status);
+            gap_drop_link_key_for_bd_addr(device->conn.btaddr);
+        }
         if (status == L2CAP_CONNECTION_RESPONSE_RESULT_REFUSED_SECURITY) {
             logi("Probably GAP-security-related issues. Set GAP security to 2\n");
         }
@@ -666,6 +685,8 @@ void uni_bt_bredr_on_gap_inquiry_result(uint16_t channel, const uint8_t* packet,
 
     supported = uni_hid_device_on_device_discovered(addr, name_buffer, cod, rssi) == UNI_ERROR_SUCCESS;
     if (supported) {
+        uni_bt_bredr_scan_stop();
+        gap_drop_link_key_for_bd_addr(addr);
         d = uni_hid_device_get_instance_for_address(addr);
         if (d) {
             if (d->conn.state == UNI_BT_CONN_STATE_DEVICE_READY) {
@@ -764,8 +785,11 @@ void uni_bt_bredr_on_hci_connection_complete(uint16_t channel, const uint8_t* pa
     if (is_keyboard) {
         // gap_request_security_level(handle, LEVEL_1);
     }
-    // Always request GAP Security Level 2 to ensure authentication, encryption and bonding/link key storage occur
-    gap_request_security_level(handle, LEVEL_2);
+    // For incoming devices, request Security Level 2 so device authenticates.
+    // For outgoing devices, L2CAP itself negotiates security after remote features query.
+    if (uni_hid_device_is_incoming(d)) {
+        gap_request_security_level(handle, LEVEL_2);
+    }
 }
 
 void uni_bt_bredr_on_hci_authentication_complete(hci_con_handle_t handle) {

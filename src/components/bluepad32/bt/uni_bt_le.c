@@ -126,17 +126,20 @@ static const char* sm_pairing_reason_to_string(uint8_t reason) {
  * Connect to remote device but set timer for timeout
  */
 static void hog_connect(bd_addr_t addr, bd_addr_type_t addr_type) {
-    // Stop scan, otherwise it will be able to connect.
-    // Happens in ESP32, but not in libusb
+    // Stop BLE scan, otherwise CYW43 will be unable to initiate connection.
     gap_stop_scan();
     logi("BLE scan -> 0\n");
 
-    uni_bt_bredr_scan_stop();
+    // Do NOT stop BR/EDR scan! Classic discovery must continue uninterrupted.
 
-    gap_connect(addr, addr_type);
+    uint8_t status = gap_connect(addr, addr_type);
+    if (status != ERROR_CODE_SUCCESS) {
+        loge("hog_connect: gap_connect to %s failed, status=0x%02x\n", bd_addr_to_str(addr), status);
+        uni_bt_le_resume_scanning_hint();
+    }
 }
 
-static void resume_scanning_hint(void) {
+void uni_bt_le_resume_scanning_hint(void) {
     // Resume scanning, only if it was scanning before connecting
     if (is_scanning) {
         gap_start_scan();
@@ -151,21 +154,34 @@ static void hog_disconnect(hci_con_handle_t con_handle) {
 
     device = uni_hid_device_get_instance_for_connection_handle(con_handle);
     if (device) {
-        status = hids_client_disconnect(device->hids_cid);
-        if (status != ERROR_CODE_SUCCESS) {
-            loge("Failed to disconnect HIDS client for hids_cid=%d, status=%d\n", device->hids_cid, status);
+        if (device->hids_cid != 0) {
+            uint16_t cid = device->hids_cid;
+            device->hids_cid = 0;
+            status = hids_client_disconnect(cid);
+            if (status != ERROR_CODE_SUCCESS) {
+                loge("Failed to disconnect HIDS client for hids_cid=%d, status=%d\n", cid, status);
+            }
         }
         // gap_delete_bonding(0, device->conn.btaddr);
     }
 
-    if (gap_get_connection_type(con_handle) != GAP_CONNECTION_INVALID)
+    if (con_handle != UNI_BT_CONN_HANDLE_INVALID && gap_get_connection_type(con_handle) != GAP_CONNECTION_INVALID) {
         gap_disconnect(con_handle);
+    } else {
+        gap_connect_cancel();
+    }
 
-    resume_scanning_hint();
+    uni_bt_le_resume_scanning_hint();
 }
 
-static void get_advertisement_data(const uint8_t* adv_data, uint8_t adv_size, uint16_t* appearance, char* name) {
+static void get_advertisement_data(const uint8_t* adv_data, uint8_t adv_size, uint16_t* appearance, char* name,
+                                   uint8_t* flags, bool* has_flags) {
     ad_context_t context;
+
+    if (flags)
+        *flags = 0;
+    if (has_flags)
+        *has_flags = false;
 
     for (ad_iterator_init(&context, adv_size, (uint8_t*)adv_data); ad_iterator_has_more(&context);
          ad_iterator_next(&context)) {
@@ -178,6 +194,10 @@ static void get_advertisement_data(const uint8_t* adv_data, uint8_t adv_size, ui
 
         switch (data_type) {
             case BLUETOOTH_DATA_TYPE_FLAGS:
+                if (size > 0 && flags && has_flags) {
+                    *flags = data[0];
+                    *has_flags = true;
+                }
                 break;
             case BLUETOOTH_DATA_TYPE_INCOMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS:
             case BLUETOOTH_DATA_TYPE_COMPLETE_LIST_OF_16_BIT_SERVICE_CLASS_UUIDS:
@@ -239,7 +259,8 @@ static void get_advertisement_data(const uint8_t* adv_data, uint8_t adv_size, ui
     }
 }
 
-static void adv_event_get_data(const uint8_t* packet, uint16_t* appearance, char* name) {
+static void adv_event_get_data(const uint8_t* packet, uint16_t* appearance, char* name, uint8_t* flags,
+                               bool* has_flags) {
     const uint8_t* ad_data;
     uint16_t ad_len;
 
@@ -247,7 +268,7 @@ static void adv_event_get_data(const uint8_t* packet, uint16_t* appearance, char
     ad_len = gap_event_advertising_report_get_data_length(packet);
 
     // if (!ad_data_contains_uuid16(ad_len, ad_data, ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE))
-    get_advertisement_data(ad_data, ad_len, appearance, name);
+    get_advertisement_data(ad_data, ad_len, appearance, name, flags, has_flags);
 }
 
 static const uint8_t s_default_boot_mouse_hid_descriptor[] = {
@@ -314,6 +335,8 @@ static const uint8_t s_default_boot_keyboard_hid_descriptor[] = {
 static bool is_le_mouse(const uni_hid_device_t* d) {
     if (!d)
         return false;
+    if (d->vendor_id == 0x04e8 && d->product_id == 0xa064)
+        return false;
     if (uni_hid_device_is_mouse(d))
         return true;
     if (d->vendor_id == 0x1235 && d->product_id == 0xaa22)
@@ -334,9 +357,11 @@ static bool is_le_mouse(const uni_hid_device_t* d) {
 static bool is_le_keyboard(const uni_hid_device_t* d) {
     if (!d)
         return false;
+    if (d->vendor_id == 0x04e8 && d->product_id == 0xa064)
+        return true;
     if (uni_hid_device_is_keyboard(d))
         return true;
-    if (d->name[0] != 0 && (strstr(d->name, "Keyboard") != NULL || strstr(d->name, "keyboard") != NULL))
+    if (d->name[0] != 0 && (strstr(d->name, "Keyboard") != NULL || strstr(d->name, "keyboard") != NULL || strstr(d->name, "Trio 500") != NULL))
         return true;
     return false;
 }
@@ -459,7 +484,7 @@ static void uni_hids_client_packet_handler(uint8_t packet_type, uint16_t channel
                     uni_hid_device_connect(device);
                     uni_hid_device_set_ready(device);
 
-                    resume_scanning_hint();
+                    uni_bt_le_resume_scanning_hint();
                     break;
                 default:
                     loge("HID service client connection failed, err 0x%02x. Removing from auto-connection.\n", status);
@@ -467,8 +492,12 @@ static void uni_hids_client_packet_handler(uint8_t packet_type, uint16_t channel
                     hids_cid = gattservice_subevent_hid_service_connected_get_hids_cid(packet);
                     device = uni_hid_device_get_instance_for_hids_cid(hids_cid);
                     if (device) {
+                        device->hids_cid = 0; // Prevent double-free as BTstack finalizes client on connection error
                         gap_auto_connection_stop(BD_ADDR_TYPE_LE_PUBLIC, device->conn.btaddr);
                         gap_auto_connection_stop(BD_ADDR_TYPE_LE_RANDOM, device->conn.btaddr);
+                        gap_delete_bonding(BD_ADDR_TYPE_LE_PUBLIC, device->conn.btaddr);
+                        gap_delete_bonding(BD_ADDR_TYPE_LE_RANDOM, device->conn.btaddr);
+                        uni_bt_allowlist_remove_addr(device->conn.btaddr);
                         hog_disconnect(device->conn.handle);
                     }
                     break;
@@ -525,10 +554,6 @@ static void hids_connect_timer_handler(btstack_timer_source_t* ts) {
     }
 
     hid_protocol_mode_t mode = HID_PROTOCOL_MODE_REPORT;
-    if (is_le_mouse(device) || is_le_keyboard(device)) {
-        logi("[UNI_BT_LE] Device is mouse/keyboard -> using HID_PROTOCOL_MODE_BOOT\n");
-        mode = HID_PROTOCOL_MODE_BOOT;
-    }
 
     logi("Search for HID service, con_handle: %#x, mode: %d\n", con_handle, mode);
     uint8_t status = hids_client_connect(con_handle, uni_hids_client_packet_handler, mode, &hids_cid);
@@ -928,8 +953,22 @@ void uni_bt_le_on_hci_event_le_meta(const uint8_t* packet, uint16_t size) {
     subevent = hci_event_le_meta_get_subevent_code(packet);
 
     switch (subevent) {
-        case HCI_SUBEVENT_LE_CONNECTION_COMPLETE:
+        case HCI_SUBEVENT_LE_CONNECTION_COMPLETE: {
+            uint8_t status = hci_subevent_le_connection_complete_get_status(packet);
             hci_subevent_le_connection_complete_get_peer_address(packet, event_addr);
+
+            if (status != ERROR_CODE_SUCCESS) {
+                logi("[UNI_BT_LE] LE connection complete: status=0x%02x (failed or cancelled for %s)\n",
+                     status, bd_addr_to_str(event_addr));
+                device = uni_hid_device_get_instance_for_address(event_addr);
+                if (device) {
+                    uni_hid_device_disconnect(device);
+                    uni_hid_device_delete(device);
+                }
+                uni_bt_le_resume_scanning_hint();
+                break;
+            }
+
             device = uni_hid_device_get_instance_for_address(event_addr);
             if (!device) {
                 logi("[UNI_BT_LE] Whitelist auto-connect incoming: creating device instance for %s\n",
@@ -959,23 +998,13 @@ void uni_bt_le_on_hci_event_le_meta(const uint8_t* packet, uint16_t size) {
                 }
             }
             con_handle = hci_subevent_le_connection_complete_get_connection_handle(packet);
-            logi("Using con_handle: %#x\n", con_handle);
+            logi("Using con_handle: %#x (addr: %s)\n", con_handle, bd_addr_to_str(event_addr));
 
             uni_hid_device_set_connection_handle(device, con_handle);
 
-            if (uni_hid_device_is_keyboard(device)) {
-                uint8_t status;
-                logi("BLE keyboard detected: skipping forced SMP pairing and querying services\n");
-                status = device_information_service_client_query(con_handle, uni_device_information_packet_handler);
-                if (status == ERROR_CODE_COMMAND_DISALLOWED) {
-                    logi("Device information query already in progress\n");
-                } else if (status != ERROR_CODE_SUCCESS) {
-                    loge("Failed to set device information client: %#x\n", status);
-                }
-            } else {
-                sm_request_pairing(con_handle);
-            }
+            sm_request_pairing(con_handle);
             break;
+        }
 
         case HCI_SUBEVENT_LE_ADVERTISING_REPORT:
             // Safely ignore it, we handle the GAP advertising report instead
@@ -1024,6 +1053,8 @@ void uni_bt_le_on_gap_event_advertising_report(const uint8_t* packet, uint16_t s
     uint16_t cod;
     uint8_t rssi;
     char name[64];
+    uint8_t flags = 0;
+    bool has_flags = false;
 
     appearance = 0;
     name[0] = 0;
@@ -1036,19 +1067,34 @@ void uni_bt_le_on_gap_event_advertising_report(const uint8_t* packet, uint16_t s
         return;
     }
 
-    adv_event_get_data(packet, &appearance, name);
+    adv_event_get_data(packet, &appearance, name, &flags, &has_flags);
 
     gamepad_info_t stored_info;
     bool has_stored = flash_storage_get_device_info(addr, &stored_info);
+    bool is_allowed = uni_bt_allowlist_is_allowed_addr(addr);
+
+    const uint8_t* ad_data = gap_event_advertising_report_get_data(packet);
+    uint16_t ad_len = gap_event_advertising_report_get_data_length(packet);
+    bool has_hid_service = ad_data_contains_uuid16(ad_len, ad_data, ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE);
+    bool is_name_keyboard = (strstr(name, "Key") != NULL || strstr(name, "key") != NULL ||
+                             strstr(name, "KBD") != NULL || strstr(name, "kbd") != NULL ||
+                             strstr(name, "Trio") != NULL || strstr(name, "Keyboard") != NULL);
+    bool is_name_mouse = (strstr(name, "Mouse") != NULL || strstr(name, "mouse") != NULL ||
+                          strstr(name, "Canosa") != NULL);
+
+    // If device is not already remembered/authorized, require pairing/discoverable mode.
+    // Unnamed devices without discoverable flags (e.g. background testing mouse) must not be paired.
+    if (!has_stored && !is_allowed && !is_name_keyboard && !is_name_mouse && !has_hid_service) {
+        if (has_flags && (flags & 0x03) == 0) {
+            return;
+        }
+    }
     if (has_stored) {
         if (stored_info.port == -1) {
             appearance = UNI_BT_HID_APPEARANCE_KEYBOARD;
         } else if (stored_info.default_mode == 1 || strstr(stored_info.name, "Mouse") != NULL ||
                    strstr(stored_info.friendly_name, "Mouse") != NULL || strstr(name, "Mouse") != NULL ||
                    strstr(name, "Canosa") != NULL) {
-            // BUG FIX: removed || stored_info.port == 0 — Port 1 (port==0) is also used by
-            // gamepads, so this condition was misidentifying any Port 1 gamepad as a mouse
-            // on reconnect. Mouse identity is correctly captured by default_mode==1 or name.
             appearance = UNI_BT_HID_APPEARANCE_MOUSE;
         } else if (appearance == 0) {
             appearance = (stored_info.default_mode == 0 || stored_info.default_mode == 2 || stored_info.port == 1)
@@ -1061,16 +1107,17 @@ void uni_bt_le_on_gap_event_advertising_report(const uint8_t* packet, uint16_t s
         }
     } else if (appearance != UNI_BT_HID_APPEARANCE_GAMEPAD && appearance != UNI_BT_HID_APPEARANCE_JOYSTICK &&
                appearance != UNI_BT_HID_APPEARANCE_MOUSE && appearance != UNI_BT_HID_APPEARANCE_KEYBOARD) {
-        if (uni_bt_allowlist_is_allowed_addr(addr)) {
-            if (strstr(name, "Key") != NULL || strstr(name, "KBD") != NULL) {
-                appearance = UNI_BT_HID_APPEARANCE_KEYBOARD;
-            } else {
-                appearance = UNI_BT_HID_APPEARANCE_MOUSE;
-            }
+        if (is_name_keyboard) {
+            appearance = UNI_BT_HID_APPEARANCE_KEYBOARD;
+        } else if (is_name_mouse) {
+            appearance = UNI_BT_HID_APPEARANCE_MOUSE;
+        } else if (has_hid_service) {
+            logi("[UNI_BT_LE] Discovered HID device via Service UUID 0x1812: %s (name='%s')\n",
+                 bd_addr_to_str(addr), name);
+            appearance = UNI_BT_HID_APPEARANCE_KEYBOARD;
+        } else if (uni_bt_allowlist_is_allowed_addr(addr)) {
+            appearance = UNI_BT_HID_APPEARANCE_MOUSE;
         } else {
-            // Don't log it. There too many devices advertising themselves.
-            if (appearance != 0 || strlen(name) != 0)
-                logd("Not a HID controller, appearance: %#x, name =%s\n", appearance, name);
             return;
         }
     }
@@ -1129,10 +1176,11 @@ void uni_bt_le_on_hci_disconnection_complete(uint16_t channel, const uint8_t* pa
     btstack_run_loop_remove_timer(&hids_watchdog_timer);
 
     if (is_scanning) {
-        resume_scanning_hint();
+        uni_bt_le_resume_scanning_hint();
     } else {
         // Re-arm hardware whitelist auto-connection so disconnected BLE devices can reconnect instantly with 0 IRQ
-        gap_connect_with_whitelist();
+        uint8_t status = gap_connect_with_whitelist();
+        logi("[UNI_BT_LE] Disconnected: re-armed whitelist auto-connection, status=0x%02x\n", status);
     }
 }
 
@@ -1200,8 +1248,8 @@ void uni_bt_le_setup(void) {
     hids_client_init(hid_descriptor_storage, sizeof(hid_descriptor_storage));
     device_information_service_client_init();
 
-    // Default passive scan parameters for pairing
-    gap_set_scan_parameters(0 /* type: passive */, 48 /* interval */, 48 /* window */);
+    // Active scanning ensures SCAN_RSP packets with device names are received during pairing
+    gap_set_scan_parameters(1 /* type: active */, 48 /* interval */, 48 /* window */);
 
     // Robust connection parameters: 15ms-30ms interval, 4 slave latency, 4000ms supervision timeout
     gap_set_connection_parameters(0x0030, 0x0030, 12, 24, 4, 400, 0x0010, 0x0030);

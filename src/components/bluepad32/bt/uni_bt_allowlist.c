@@ -152,6 +152,10 @@ void uni_bt_allowlist_set_enabled(bool enabled) {
     }
 }
 
+void uni_bt_allowlist_set_enforced_temporary(bool enabled) {
+    enforced = enabled;
+}
+
 void uni_bt_allowlist_init(void) {
     uni_property_value_t val;
 
