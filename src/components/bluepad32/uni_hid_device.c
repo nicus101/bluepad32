@@ -68,11 +68,15 @@ void uni_hid_device_setup(void) {
 }
 
 uni_hid_device_t* uni_hid_device_create(bd_addr_t address) {
+    if (bd_addr_cmp(address, zero_addr) == 0) {
+        loge("Error: cannot create device with zero address\n");
+        return NULL;
+    }
     for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
         if (bd_addr_cmp(g_devices[i].conn.btaddr, zero_addr) == 0) {
             logi("Creating device: %s (idx=%d)\n", bd_addr_to_str(address), i);
 
-            memset(&g_devices[i], 0, sizeof(g_devices[i]));
+            uni_hid_device_init(&g_devices[i]);
             bd_addr_copy(g_devices[i].conn.btaddr, address);
 
             // Delete device if it doesn't have a connection
@@ -131,9 +135,14 @@ void uni_hid_device_init(uni_hid_device_t* d) {
 }
 
 uni_hid_device_t* uni_hid_device_get_instance_for_address(bd_addr_t addr) {
+    if (bd_addr_cmp(addr, zero_addr) == 0) {
+        return NULL;
+    }
     for (int i = 0; i < CONFIG_BLUEPAD32_MAX_DEVICES; i++) {
         // Ignore virtual devices since they share the same address with their parents
-        if (!uni_hid_device_is_virtual_device(&g_devices[i]) && bd_addr_cmp(addr, g_devices[i].conn.btaddr) == 0) {
+        if (!uni_hid_device_is_virtual_device(&g_devices[i]) &&
+            bd_addr_cmp(g_devices[i].conn.btaddr, zero_addr) != 0 &&
+            bd_addr_cmp(addr, g_devices[i].conn.btaddr) == 0) {
             return &g_devices[i];
         }
     }
@@ -466,7 +475,7 @@ void uni_hid_device_disconnect(uni_hid_device_t* d) {
     // Cleanup
     if (!uni_hid_device_is_virtual_device(d)) {
         type = gap_get_connection_type(d->conn.handle);
-        if (IS_ENABLED(UNI_ENABLE_BLE) && type == GAP_CONNECTION_LE)
+        if (IS_ENABLED(UNI_ENABLE_BLE) && (type == GAP_CONNECTION_LE || (type == GAP_CONNECTION_INVALID && d->conn.protocol == UNI_BT_CONN_PROTOCOL_BLE)))
             uni_bt_le_disconnect(d);
         else if (IS_ENABLED(UNI_ENABLE_BREDR) && type == GAP_CONNECTION_ACL)
             uni_bt_bredr_disconnect(d);
@@ -480,6 +489,8 @@ void uni_hid_device_disconnect(uni_hid_device_t* d) {
     // Disconnected, so no longer needs the timers
     btstack_run_loop_remove_timer(&d->connection_timer);
     btstack_run_loop_remove_timer(&d->inquiry_remote_name_timer);
+    btstack_run_loop_remove_timer(&d->role_switch_timer);
+    d->role_switch_requested = false;
 
     // If it was already connected, tell platforms
     if (connected)
@@ -598,7 +609,15 @@ void uni_hid_device_guess_controller_type_from_pid_vid(uni_hid_device_t* d) {
     if (type == CONTROLLER_TYPE_Unknown || type == CONTROLLER_TYPE_UnknownNonSteamController ||
         type == CONTROLLER_TYPE_UnknownSteamController) {
         logi("Device (vendor_id=0x%04x, product_id=0x%04x) not found in DB.\n", d->vendor_id, d->product_id);
-        if (uni_hid_device_is_mouse(d)) {
+        if (d->vendor_id == 0x04e8 && d->product_id == 0xa064) {
+            type = CONTROLLER_TYPE_GenericKeyboard;
+            if (strlen(d->name) == 0) {
+                strncpy(d->name, "Samsung Smart Keyboard Trio 500", sizeof(d->name) - 1);
+                d->name[sizeof(d->name) - 1] = '\0';
+            }
+        } else if (d->vendor_id == 0x1235 && d->product_id == 0xaa22) {
+            type = CONTROLLER_TYPE_GenericMouse;
+        } else if (uni_hid_device_is_mouse(d)) {
             type = CONTROLLER_TYPE_GenericMouse;
         } else if (uni_hid_device_is_keyboard(d)) {
             type = CONTROLLER_TYPE_GenericKeyboard;
@@ -776,7 +795,16 @@ bool uni_hid_device_has_controller_type(const uni_hid_device_t* d) {
 }
 
 void uni_hid_device_set_connection_handle(uni_hid_device_t* d, hci_con_handle_t handle) {
+    if (d == NULL) {
+        loge("ERROR: Invalid device\n");
+        return;
+    }
     d->conn.handle = handle;
+
+    // Link established: extend connection timer to full timeout for service discovery
+    btstack_run_loop_remove_timer(&d->connection_timer);
+    btstack_run_loop_set_timer(&d->connection_timer, HID_DEVICE_CONNECTION_TIMEOUT_MS);
+    btstack_run_loop_add_timer(&d->connection_timer);
 }
 
 void uni_hid_device_process_controller(uni_hid_device_t* d) {
@@ -888,6 +916,16 @@ bool uni_hid_device_is_mouse(const uni_hid_device_t* d) {
         return false;
     }
 
+    if (d->vendor_id == 0x04e8 && d->product_id == 0xa064) {
+        return false;
+    }
+
+    if (d->name[0] != 0 && (strstr(d->name, "Key") != NULL || strstr(d->name, "key") != NULL ||
+                            strstr(d->name, "KBD") != NULL || strstr(d->name, "kbd") != NULL ||
+                            strstr(d->name, "Trio 500") != NULL || strstr(d->name, "Keyboard") != NULL)) {
+        return false;
+    }
+
     if (d->controller_type == CONTROLLER_TYPE_GenericMouse ||
         d->controller.klass == UNI_CONTROLLER_CLASS_MOUSE) {
         return true;
@@ -913,6 +951,16 @@ bool uni_hid_device_is_keyboard(const uni_hid_device_t* d) {
     if (d == NULL) {
         loge("uni_hid_device_is_keyboard: failed, device is NULL\n");
         return false;
+    }
+
+    if (d->vendor_id == 0x04e8 && d->product_id == 0xa064) {
+        return true;
+    }
+
+    if (d->name[0] != 0 && (strstr(d->name, "Key") != NULL || strstr(d->name, "key") != NULL ||
+                            strstr(d->name, "KBD") != NULL || strstr(d->name, "kbd") != NULL ||
+                            strstr(d->name, "Trio 500") != NULL || strstr(d->name, "Keyboard") != NULL)) {
+        return true;
     }
 
     if (d->controller_type == CONTROLLER_TYPE_GenericKeyboard ||
@@ -1027,11 +1075,17 @@ static void device_connection_timeout(btstack_timer_source_t* ts) {
     uni_hid_device_disconnect(d);
     uni_hid_device_delete(d);
     /* 'd'' is destroyed after this call, don't use it */
+
+    // Ensure scanning is resumed if interrupted by this connection attempt
+    uni_bt_le_resume_scanning_hint();
 }
 
 static void start_connection_timeout(uni_hid_device_t* d) {
     btstack_run_loop_set_timer_context(&d->connection_timer, d);
     btstack_run_loop_set_timer_handler(&d->connection_timer, &device_connection_timeout);
-    btstack_run_loop_set_timer(&d->connection_timer, HID_DEVICE_CONNECTION_TIMEOUT_MS);
+    // Unconnected devices get 10 seconds to establish physical link, authenticate, and pair.
+    // Once established (in uni_hid_device_set_connection_handle), timer is extended to full duration.
+    uint32_t timeout_ms = (d->conn.handle == UNI_BT_CONN_HANDLE_INVALID) ? 10000 : HID_DEVICE_CONNECTION_TIMEOUT_MS;
+    btstack_run_loop_set_timer(&d->connection_timer, timeout_ms);
     btstack_run_loop_add_timer(&d->connection_timer);
 }

@@ -30,6 +30,7 @@
 
 #define INQUIRY_REMOTE_NAME_TIMEOUT_MS 4500
 _Static_assert(INQUIRY_REMOTE_NAME_TIMEOUT_MS < HID_DEVICE_CONNECTION_TIMEOUT_MS, "Timeout too big");
+#define ROLE_SWITCH_TIMEOUT_MS 300
 
 static bool bt_bredr_enabled = true;
 
@@ -86,6 +87,45 @@ static void inquiry_remote_name_timeout_callback(btstack_timer_source_t* ts) {
     uni_bt_bredr_process_fsm(d);
 }
 
+static void arm_role_switch_timeout(uni_hid_device_t* d);
+
+static void role_switch_timeout_callback(btstack_timer_source_t* ts) {
+    uni_hid_device_t* d = btstack_run_loop_get_timer_context(ts);
+    hci_role_t current_role = gap_get_role(d->conn.handle);
+    logi("Role switch wait expired for %s (current role=%s)\n",
+         bd_addr_to_str(d->conn.btaddr), current_role == HCI_ROLE_MASTER ? "MASTER" : "SLAVE");
+
+    if (current_role == HCI_ROLE_MASTER) {
+        if (d->conn.control_cid == 0 && device_requires_host_l2cap(d)) {
+            uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
+            uni_bt_bredr_process_fsm(d);
+        }
+        return;
+    }
+
+    if (!d->role_switch_requested) {
+        d->role_switch_requested = true;
+        logi("Explicitly requesting role switch to MASTER now for %s\n", bd_addr_to_str(d->conn.btaddr));
+        gap_request_role(d->conn.btaddr, HCI_ROLE_MASTER);
+        arm_role_switch_timeout(d);
+        return;
+    }
+
+    logi("Role switch timed out completely for %s, proceeding with L2CAP anyway\n", bd_addr_to_str(d->conn.btaddr));
+    if (d->conn.control_cid == 0 && device_requires_host_l2cap(d)) {
+        uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
+        uni_bt_bredr_process_fsm(d);
+    }
+}
+
+static void arm_role_switch_timeout(uni_hid_device_t* d) {
+    btstack_run_loop_remove_timer(&d->role_switch_timer);
+    btstack_run_loop_set_timer_handler(&d->role_switch_timer, role_switch_timeout_callback);
+    btstack_run_loop_set_timer_context(&d->role_switch_timer, d);
+    btstack_run_loop_set_timer(&d->role_switch_timer, ROLE_SWITCH_TIMEOUT_MS);
+    btstack_run_loop_add_timer(&d->role_switch_timer);
+}
+
 static bool s_bredr_scanning = false;
 
 void uni_bt_bredr_scan_start(void) {
@@ -117,6 +157,7 @@ void uni_bt_bredr_scan_stop(void) {
 
 // Called from uni_hid_device_disconnect()
 void uni_bt_bredr_disconnect(uni_hid_device_t* d) {
+    btstack_run_loop_remove_timer(&d->role_switch_timer);
     if (gap_get_connection_type(d->conn.handle) != GAP_CONNECTION_INVALID) {
         gap_disconnect(d->conn.handle);
         d->conn.handle = UNI_BT_CONN_HANDLE_INVALID;
@@ -207,6 +248,9 @@ void uni_bt_bredr_setup(void) {
 
     // Allow sniff mode requests by HID device and support role switch
     gap_set_default_link_policy_settings(LM_LINK_POLICY_ENABLE_SNIFF_MODE | LM_LINK_POLICY_ENABLE_ROLE_SWITCH);
+
+    // Set local Bluetooth name so Nintendo Switch controllers recognize the host
+    gap_set_local_name("Nintendo Switch");
 
     // Enable RSSI and EIR for gap_inquiry
     // TODO: Do we need EIR, since the name will be requested if not provided?
@@ -528,6 +572,25 @@ void uni_bt_bredr_on_l2cap_channel_opened(uint16_t channel, const uint8_t* packe
     status = l2cap_event_channel_opened_get_status(packet);
     if (status) {
         logi("L2CAP Connection failed: 0x%02x.\n", status);
+        if (status == ERROR_CODE_ACL_CONNECTION_ALREADY_EXISTS) {
+            logi("ACL connection already exists for %s, keeping device instance and waiting for link\n",
+                 bd_addr_to_str(address));
+            device->conn.control_cid = 0;
+            hci_connection_t* conn = hci_connection_for_bd_addr_and_type(address, BD_ADDR_TYPE_ACL);
+            if (conn != NULL && conn->state == OPEN) {
+                logi("Adopting existing open ACL link (handle=0x%04x) for %s\n", conn->con_handle,
+                     bd_addr_to_str(address));
+                uni_hid_device_set_connection_handle(device, conn->con_handle);
+                l2cap_create_control_connection(device);
+            }
+            return;
+        }
+        if (status == L2CAP_CONNECTION_RESPONSE_RESULT_REFUSED_SECURITY ||
+            status == L2CAP_CONNECTION_BASEBAND_DISCONNECT ||
+            status == 0x05) {
+            logi("Dropping link key for %s on failure 0x%02x\n", bd_addr_to_str(address), status);
+            gap_drop_link_key_for_bd_addr(device->conn.btaddr);
+        }
         if (status == L2CAP_CONNECTION_RESPONSE_RESULT_REFUSED_SECURITY) {
             logi("Probably GAP-security-related issues. Set GAP security to 2\n");
         }
@@ -666,6 +729,8 @@ void uni_bt_bredr_on_gap_inquiry_result(uint16_t channel, const uint8_t* packet,
 
     supported = uni_hid_device_on_device_discovered(addr, name_buffer, cod, rssi) == UNI_ERROR_SUCCESS;
     if (supported) {
+        uni_bt_bredr_scan_stop();
+        gap_drop_link_key_for_bd_addr(addr);
         d = uni_hid_device_get_instance_for_address(addr);
         if (d) {
             if (d->conn.state == UNI_BT_CONN_STATE_DEVICE_READY) {
@@ -749,6 +814,11 @@ void uni_bt_bredr_on_hci_connection_complete(uint16_t channel, const uint8_t* pa
 
     handle = hci_event_connection_complete_get_connection_handle(packet);
     uni_hid_device_set_connection_handle(d, handle);
+    d->role_switch_requested = false;
+
+    // Explicitly configure link policy on this connection handle to allow Role Switch and Sniff mode
+    hci_send_cmd(&hci_write_link_policy_settings, handle,
+                 LM_LINK_POLICY_ENABLE_ROLE_SWITCH | LM_LINK_POLICY_ENABLE_SNIFF_MODE);
 
     if (!uni_hid_device_has_name(d)) {
         gamepad_info_t info;
@@ -764,8 +834,11 @@ void uni_bt_bredr_on_hci_connection_complete(uint16_t channel, const uint8_t* pa
     if (is_keyboard) {
         // gap_request_security_level(handle, LEVEL_1);
     }
-    // Always request GAP Security Level 2 to ensure authentication, encryption and bonding/link key storage occur
-    gap_request_security_level(handle, LEVEL_2);
+    // For incoming devices, request Security Level 2 so device authenticates.
+    // For outgoing devices, L2CAP itself negotiates security after remote features query.
+    if (uni_hid_device_is_incoming(d)) {
+        gap_request_security_level(handle, LEVEL_2);
+    }
 }
 
 void uni_bt_bredr_on_hci_authentication_complete(hci_con_handle_t handle) {
@@ -799,12 +872,28 @@ void uni_bt_bredr_on_hci_authentication_complete(hci_con_handle_t handle) {
                 gap_remote_name_request(d->conn.btaddr, 0x02, 0x0000);
 
             uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_INQUIRED);
-        } else if (sec >= LEVEL_2) {
-            uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
-            uni_bt_bredr_process_fsm(d);
-        } else {
+        } else if (sec >= LEVEL_2 && d->conn.control_cid == 0) {
+            if (device_requires_host_l2cap(d) && gap_get_role(handle) != HCI_ROLE_MASTER) {
+                logi("uni_bt_bredr_on_hci_authentication_complete: waiting for role switch to MASTER for %s\n",
+                     bd_addr_to_str(d->conn.btaddr));
+                arm_role_switch_timeout(d);
+            } else {
+                // BUG FIX: Only kick the FSM here when L2CAP hasn't started yet.
+                // A second HCI_AUTHENTICATION_COMPLETE arrives for incoming Switch Pro controllers
+                // after L2CAP Control is already open (link key upgrade for the interrupt channel
+                // authentication). Without the control_cid == 0 guard, this resets state to
+                // REMOTE_NAME_FETCHED and calls process_fsm while both CIDs happen to be set
+                // (interrupt was being created), causing uni_hid_device_set_ready() to fire before
+                // the interrupt channel is fully open, then again when it opens -> double
+                // on_device_ready -> platform hung waiting for a response that never comes.
+                uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
+                uni_bt_bredr_process_fsm(d);
+            }
+        } else if (sec < LEVEL_2 && d->conn.control_cid == 0) {
             logi("uni_bt_bredr_on_hci_authentication_complete: waiting for encryption change before L2CAP\n");
         }
+        // else: auth completed again after L2CAP already started (e.g. link key upgrade for
+        // interrupt channel); the FSM will be driven by L2CAP channel events, not auth events.
     } else if (d->conn.control_cid == 0) {
         logi("uni_bt_bredr_on_hci_authentication_complete: starting L2CAP control connection\n");
         l2cap_create_control_connection(d);
@@ -828,9 +917,15 @@ void uni_bt_bredr_on_hci_encryption_change(hci_con_handle_t handle, uint8_t enc_
     }
 
     if (uni_hid_device_is_incoming(d) && d->conn.control_cid == 0 && device_requires_host_l2cap(d)) {
-        logi("uni_bt_bredr_on_hci_encryption_change: starting L2CAP connection after encryption enabled\n");
-        uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
-        uni_bt_bredr_process_fsm(d);
+        if (gap_get_role(handle) != HCI_ROLE_MASTER) {
+            logi("uni_bt_bredr_on_hci_encryption_change: waiting for role switch to MASTER before L2CAP for %s\n",
+                 bd_addr_to_str(d->conn.btaddr));
+            arm_role_switch_timeout(d);
+        } else {
+            logi("uni_bt_bredr_on_hci_encryption_change: starting L2CAP connection after encryption enabled\n");
+            uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
+            uni_bt_bredr_process_fsm(d);
+        }
     }
 }
 
@@ -917,11 +1012,52 @@ void uni_bt_bredr_on_hci_remote_name_request_complete(uint16_t channel, const ui
         // See: https://gitlab.com/ricardoquesada/bluepad32/-/issues/21
         if (uni_bt_conn_get_state(&d->conn) < UNI_BT_CONN_STATE_DEVICE_PENDING_READY) {
             // Only update state if the device is not already ready.
-            uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
-            uni_bt_bredr_process_fsm(d);
+            if (device_requires_host_l2cap(d) && gap_get_role(d->conn.handle) != HCI_ROLE_MASTER) {
+                logi("remote_name_request_complete: waiting for role switch to MASTER for %s\n",
+                     bd_addr_to_str(event_addr));
+                arm_role_switch_timeout(d);
+            } else {
+                uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
+                uni_bt_bredr_process_fsm(d);
+            }
         }
 
         // Remove timer
         btstack_run_loop_remove_timer(&d->inquiry_remote_name_timer);
+    }
+}
+
+void uni_bt_bredr_on_hci_role_change(const uint8_t* packet, uint16_t size) {
+    ARG_UNUSED(size);
+    uint8_t status = hci_event_role_change_get_status(packet);
+    bd_addr_t addr;
+    hci_event_role_change_get_bd_addr(packet, addr);
+    uint8_t role = hci_event_role_change_get_role(packet);
+
+    logi("uni_bt_bredr_on_hci_role_change: %s, status=0x%02x, role=%s\n",
+         bd_addr_to_str(addr), status, role == HCI_ROLE_MASTER ? "MASTER" : "SLAVE");
+
+    uni_hid_device_t* d = uni_hid_device_get_instance_for_address(addr);
+    if (!d)
+        return;
+
+    btstack_run_loop_remove_timer(&d->role_switch_timer);
+    d->role_switch_requested = false;
+
+    if (status == 0 && role == HCI_ROLE_MASTER) {
+        logi("Role switch to MASTER succeeded for %s\n", bd_addr_to_str(addr));
+    } else {
+        logi("Role switch failed or non-master (status 0x%02x, role %d) for %s\n", status, role, bd_addr_to_str(addr));
+    }
+
+    gap_security_level_t sec = gap_security_level(d->conn.handle);
+    if (uni_hid_device_is_incoming(d) && d->conn.control_cid == 0 && device_requires_host_l2cap(d)) {
+        if (sec >= LEVEL_2) {
+            logi("uni_bt_bredr_on_hci_role_change: starting L2CAP connection for %s\n", bd_addr_to_str(addr));
+            uni_bt_conn_set_state(&d->conn, UNI_BT_CONN_STATE_REMOTE_NAME_FETCHED);
+            uni_bt_bredr_process_fsm(d);
+        } else {
+            logi("uni_bt_bredr_on_hci_role_change: role switch done, waiting for encryption (sec=%d)\n", sec);
+        }
     }
 }

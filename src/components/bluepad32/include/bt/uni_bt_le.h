@@ -25,6 +25,7 @@ void uni_bt_le_on_hci_disconnection_complete(uint16_t channel, const uint8_t* pa
 
 void uni_bt_le_scan_start(void);
 void uni_bt_le_scan_stop(void);
+void uni_bt_le_resume_scanning_hint(void);
 
 // Called from uni_hid_device_disconnect()
 void uni_bt_le_disconnect(uni_hid_device_t* d);
@@ -32,6 +33,10 @@ void uni_bt_le_disconnect(uni_hid_device_t* d);
 void uni_bt_le_list_bonded_keys(void);
 void uni_bt_le_delete_bonded_keys(void);
 void uni_bt_le_setup(void);
+
+void uni_bt_le_add_auto_connection(bd_addr_type_t address_type, const bd_addr_t address);
+void uni_bt_le_remove_auto_connection(bd_addr_type_t address_type, const bd_addr_t address);
+void uni_bt_le_arm_auto_connection(void);
 
 void uni_bt_le_set_enabled(bool enabled);
 bool uni_bt_le_is_enabled(void);

@@ -158,13 +158,16 @@ static void on_hci_disconnection_complete(uint16_t channel, const uint8_t* packe
     reason = hci_event_disconnection_complete_get_reason(packet);
     status = hci_event_disconnection_complete_get_status(packet);
 
+    logi("on_hci_disconnection_complete: handle=0x%04x, status=0x%02x, reason=0x%02x\n", handle, status, reason);
+
     // Xbox Wireless Controller starts an incoming connection when told to enter in "discovery mode". If the connection
     // fails (HCI_EVENT_DISCONNECTION_COMPLETE is generated) then it starts the discovery. So, delete the
     // possible-previous created entry. This highly increases the reliability of Xbox Wireless controllers.
     d = uni_hid_device_get_instance_for_connection_handle(handle);
     if (d) {
-        // Get type before it gets destroyed.
+        // Get type and protocol before device gets destroyed.
         type = gap_get_connection_type(d->conn.handle);
+        uni_bt_conn_protocol_t proto = d->conn.protocol;
 
         logi("Device %s disconnected, deleting it. Reason=%#x, status=%d\n", bd_addr_to_str(d->conn.btaddr), reason,
              status);
@@ -173,9 +176,9 @@ static void on_hci_disconnection_complete(uint16_t channel, const uint8_t* packe
         // Device cannot be used after delete.
         d = NULL;
 
-        if (IS_ENABLED(UNI_ENABLE_BLE) && type == GAP_CONNECTION_LE)
+        if (IS_ENABLED(UNI_ENABLE_BLE) && (type == GAP_CONNECTION_LE || proto == UNI_BT_CONN_PROTOCOL_BLE))
             uni_bt_le_on_hci_disconnection_complete(channel, packet, size);
-        else if (IS_ENABLED(UNI_ENABLE_BREDR) && type == GAP_CONNECTION_ACL)
+        else if (IS_ENABLED(UNI_ENABLE_BREDR) && (type == GAP_CONNECTION_ACL || proto == UNI_BT_CONN_PROTOCOL_BR_EDR))
             uni_bt_bredr_on_hci_disconnection_complete(channel, packet, size);
         else
             loge("on_hci_disconnection_complete: Unknown GAP connection type: %d\n", type);
@@ -183,6 +186,9 @@ static void on_hci_disconnection_complete(uint16_t channel, const uint8_t* packe
 
     if (IS_ENABLED(UNI_ENABLE_BREDR)) {
         gap_connectable_control(1);
+        if (!uni_bt_allowlist_is_enabled()) {
+            uni_bt_bredr_scan_start();
+        }
     }
 }
 
@@ -375,6 +381,13 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                              status);
                     break;
                 }
+                case HCI_EVENT_COMMAND_STATUS: {
+                    uint16_t opcode = hci_event_command_status_get_command_opcode(packet);
+                    status = hci_event_command_status_get_status(packet);
+                    if (status)
+                        logi("Failed command: HCI_EVENT_COMMAND_STATUS: opcode = 0x%04x - status=%d\n", opcode, status);
+                    break;
+                }
                 case HCI_EVENT_AUTHENTICATION_COMPLETE_EVENT: {
                     status = hci_event_authentication_complete_get_status(packet);
                     handle = hci_event_authentication_complete_get_connection_handle(packet);
@@ -476,6 +489,8 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                     break;
                 case HCI_EVENT_ROLE_CHANGE:
                     logi("--> HCI_EVENT_ROLE_CHANGE\n");
+                    if (IS_ENABLED(UNI_ENABLE_BREDR))
+                        uni_bt_bredr_on_hci_role_change(packet, size);
                     break;
                 case HCI_EVENT_SYNCHRONOUS_CONNECTION_COMPLETE:
                     logi("--> HCI_EVENT_SYNCHRONOUS_CONNECTION_COMPLETE\n");

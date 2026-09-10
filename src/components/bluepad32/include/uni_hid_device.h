@@ -42,6 +42,9 @@ struct uni_hid_device_s {
     btstack_timer_source_t connection_timer;
     // Max amount of time to wait to get the device name.
     btstack_timer_source_t inquiry_remote_name_timer;
+    // Timeout fallback for waiting for incoming role switch to Master
+    btstack_timer_source_t role_switch_timer;
+    bool role_switch_requested;
 
     // SDP
     uint8_t hid_descriptor[HID_MAX_DESCRIPTOR_LEN];
