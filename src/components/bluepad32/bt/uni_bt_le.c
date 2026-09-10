@@ -1249,10 +1249,11 @@ void uni_bt_le_setup(void) {
     device_information_service_client_init();
 
     // Active scanning ensures SCAN_RSP packets with device names are received during pairing
-    gap_set_scan_parameters(1 /* type: active */, 48 /* interval */, 48 /* window */);
+    // 50% duty cycle (interval 96 * 0.625ms = 60ms, window 48 * 0.625ms = 30ms) leaves time for other radio activity
+    gap_set_scan_parameters(1 /* type: active */, 96 /* interval */, 48 /* window */);
 
-    // Robust connection parameters: 15ms-30ms interval, 4 slave latency, 4000ms supervision timeout
-    gap_set_connection_parameters(0x0030, 0x0030, 12, 24, 4, 400, 0x0010, 0x0030);
+    // Balanced connection parameters: interval 0x0060 (60ms), window 0x0020 (20ms) -> 33% duty cycle
+    gap_set_connection_parameters(0x0060, 0x0020, 12, 24, 4, 400, 0x0010, 0x0030);
 }
 
 void uni_bt_le_add_auto_connection(bd_addr_type_t address_type, const bd_addr_t address) {

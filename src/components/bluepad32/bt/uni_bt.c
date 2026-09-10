@@ -381,6 +381,13 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                              status);
                     break;
                 }
+                case HCI_EVENT_COMMAND_STATUS: {
+                    uint16_t opcode = hci_event_command_status_get_command_opcode(packet);
+                    status = hci_event_command_status_get_status(packet);
+                    if (status)
+                        logi("Failed command: HCI_EVENT_COMMAND_STATUS: opcode = 0x%04x - status=%d\n", opcode, status);
+                    break;
+                }
                 case HCI_EVENT_AUTHENTICATION_COMPLETE_EVENT: {
                     status = hci_event_authentication_complete_get_status(packet);
                     handle = hci_event_authentication_complete_get_connection_handle(packet);
@@ -482,6 +489,8 @@ void uni_bt_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t* packe
                     break;
                 case HCI_EVENT_ROLE_CHANGE:
                     logi("--> HCI_EVENT_ROLE_CHANGE\n");
+                    if (IS_ENABLED(UNI_ENABLE_BREDR))
+                        uni_bt_bredr_on_hci_role_change(packet, size);
                     break;
                 case HCI_EVENT_SYNCHRONOUS_CONNECTION_COMPLETE:
                     logi("--> HCI_EVENT_SYNCHRONOUS_CONNECTION_COMPLETE\n");

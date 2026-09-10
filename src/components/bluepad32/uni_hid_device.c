@@ -489,6 +489,8 @@ void uni_hid_device_disconnect(uni_hid_device_t* d) {
     // Disconnected, so no longer needs the timers
     btstack_run_loop_remove_timer(&d->connection_timer);
     btstack_run_loop_remove_timer(&d->inquiry_remote_name_timer);
+    btstack_run_loop_remove_timer(&d->role_switch_timer);
+    d->role_switch_requested = false;
 
     // If it was already connected, tell platforms
     if (connected)
